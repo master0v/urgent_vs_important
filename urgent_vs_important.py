@@ -12,6 +12,7 @@ try:
 except ImportError:
     import tkinter as tk
 
+
 try:
     import ttk
     py3 = False
@@ -19,7 +20,10 @@ except ImportError:
     import tkinter.ttk as ttk
     py3 = True
 
+#import tkinter.dnd as dnd
+
 import urgent_vs_important_support
+
 
 def vp_start_gui():
     '''Starting point when module is the main routine.'''
@@ -29,160 +33,238 @@ def vp_start_gui():
     urgent_vs_important_support.init(root, top)
     root.mainloop()
 
+
 w = None
 def create_Toplevel1(rt, *args, **kwargs):
-    '''Starting point when module is imported by another module.
-       Correct form of call: 'create_Toplevel1(root, *args, **kwargs)' .'''
-    global w, w_win, root
-    #rt = root
-    root = rt
-    w = tk.Toplevel (root)
-    top = Toplevel1 (w)
-    urgent_vs_important_support.init(w, top, *args, **kwargs)
-    return (w, top)
+  '''Starting point when module is imported by another module.
+     Correct form of call: 'create_Toplevel1(root, *args, **kwargs)' .'''
+  global w, w_win, root
+  #rt = root
+  root = rt
+  w = tk.Toplevel (root)
+  top = Toplevel1 (w)
+  urgent_vs_important_support.init(w, top, *args, **kwargs)
+  return (w, top)
+
 
 def destroy_Toplevel1():
-    global w
-    w.destroy()
-    w = None
+  global w
+  w.destroy()
+  w = None
+
 
 class Toplevel1:
-    def __init__(self, top=None):
-        '''This class configures and populates the toplevel window.
-           top is the toplevel containing window.'''
-        _bgcolor = '#d9d9d9'  # X11 color: 'gray85'
-        _fgcolor = '#000000'  # X11 color: 'black'
-        _compcolor = '#d9d9d9' # X11 color: 'gray85'
-        _ana1color = '#d9d9d9' # X11 color: 'gray85'
-        _ana2color = '#ececec' # Closest X11 color: 'gray92'
-        self.style = ttk.Style()
-        if sys.platform == "win32":
-            self.style.theme_use('winnative')
-        self.style.configure('.',background=_bgcolor)
-        self.style.configure('.',foreground=_fgcolor)
-        self.style.configure('.',font="TkDefaultFont")
-        self.style.map('.',background=
-            [('selected', _compcolor), ('active',_ana2color)])
 
-        top.geometry("795x653+302+99")
-        top.minsize(72, 15)
-        top.maxsize(1399, 847)
-        top.resizable(1,  1)
-        top.title("Prioritize!")
-        top.configure(background="#d9d9d9")
-        top.configure(highlightbackground="#d9d9d9")
-        top.configure(highlightcolor="black")
+  def __init__(self, top=None):
+    '''This class configures and populates the toplevel window.
+       top is the toplevel containing window.'''
+    _bgcolor = '#d9d9d9'  # X11 color: 'gray85'
+    _fgcolor = '#000000'  # X11 color: 'black'
+    _compcolor = '#d9d9d9' # X11 color: 'gray85'
+    _ana1color = '#d9d9d9' # X11 color: 'gray85'
+    _ana2color = '#ececec' # Closest X11 color: 'gray92'
+    self.style = ttk.Style()
+    if sys.platform == "win32":
+        self.style.theme_use('winnative')
+    self.style.configure('.',background=_bgcolor)
+    self.style.configure('.',foreground=_fgcolor)
+    self.style.configure('.',font="TkDefaultFont")
+    self.style.map('.',background=
+        [('selected', _compcolor), ('active',_ana2color)])
 
-        self.style.configure('TSizegrip', background=_bgcolor)
-        self.TSizegrip1 = ttk.Sizegrip(top)
-        self.TSizegrip1.place(anchor='se', relx=1.0, rely=1.0)
+    top.geometry("795x653+302+99")
+    top.minsize(72, 15)
+    top.maxsize(1399, 847)
+    top.resizable(1,  1)
+    top.title("Prioritize!")
+    top.configure(background="#d9d9d9")
+    top.configure(highlightbackground="#d9d9d9")
+    top.configure(highlightcolor="black")
 
-        self.Canvas1 = tk.Canvas(top)
-        self.Canvas1.place(relx=0.299, rely=0.006, relheight=0.983
-                , relwidth=0.693)
-        self.Canvas1.configure(background="#d9d9d9")
-        self.Canvas1.configure(borderwidth="2")
-        self.Canvas1.configure(highlightbackground="#d9d9d9")
-        self.Canvas1.configure(highlightcolor="black")
-        self.Canvas1.configure(insertbackground="black")
-        self.Canvas1.configure(relief="ridge")
-        self.Canvas1.configure(selectbackground="blue")
-        self.Canvas1.configure(selectforeground="white")
+    self.style.configure('TSizegrip', background=_bgcolor)
+    self.TSizegrip1 = ttk.Sizegrip(top)
+    self.TSizegrip1.place(anchor='se', relx=1.0, rely=1.0)
 
-        self.TSeparator1 = ttk.Separator(self.Canvas1)
-        self.TSeparator1.place(relx=0.02, rely=0.514,  relwidth=0.958)
+    self.Canvas1 = tk.Canvas(top)
+    self.Canvas1.place(relx=0.299, rely=0.006, relheight=0.983
+            , relwidth=0.693)
+    self.Canvas1.configure(background="#d9d9d9")
+    self.Canvas1.configure(borderwidth="2")
+    self.Canvas1.configure(highlightbackground="#d9d9d9")
+    self.Canvas1.configure(highlightcolor="black")
+    self.Canvas1.configure(insertbackground="black")
+    self.Canvas1.configure(relief="ridge")
+    self.Canvas1.configure(selectbackground="blue")
+    self.Canvas1.configure(selectforeground="white")
+    
+    # this data is used to keep track of an
+    # item being dragged
+    self._drag_data = {"x": 0, "y": 0, "item": None}
 
-        self.TSeparator2 = ttk.Separator(self.Canvas1)
-        self.TSeparator2.place(relx=0.508, rely=0.016,  relheight=0.981)
-        self.TSeparator2.configure(orient="vertical")
+    # create a couple of movable objects
+    self.create_token(100, 100, "white")
+    self.create_token(200, 100, "black")
+    
+    # add bindings for clicking, dragging and releasing over
+    # any object with the "token" tag
+    self.Canvas1.tag_bind("token", "<ButtonPress-1>", self.drag_start)
+    self.Canvas1.tag_bind("token", "<ButtonRelease-1>", self.drag_stop)
+    self.Canvas1.tag_bind("token", "<B1-Motion>", self.drag)
 
-        self.style.configure('Treeview',  font="TkDefaultFont")
-        self.Scrolledtreeview1 = ScrolledTreeView(top)
-        self.Scrolledtreeview1.place(relx=0.008, rely=0.006, relheight=0.98
-                , relwidth=0.289)
-        self.Scrolledtreeview1.configure(columns="Col1")
-        # build_treeview_support starting.
-        self.Scrolledtreeview1.heading("#0",text="Tree")
-        self.Scrolledtreeview1.heading("#0",anchor="center")
-        self.Scrolledtreeview1.column("#0",width="110")
-        self.Scrolledtreeview1.column("#0",minwidth="20")
-        self.Scrolledtreeview1.column("#0",stretch="1")
-        self.Scrolledtreeview1.column("#0",anchor="w")
-        self.Scrolledtreeview1.heading("Col1",text="Col1")
-        self.Scrolledtreeview1.heading("Col1",anchor="center")
-        self.Scrolledtreeview1.column("Col1",width="110")
-        self.Scrolledtreeview1.column("Col1",minwidth="20")
-        self.Scrolledtreeview1.column("Col1",stretch="1")
-        self.Scrolledtreeview1.column("Col1",anchor="w")
+    self.TSeparator1 = ttk.Separator(self.Canvas1)
+    self.TSeparator1.place(relx=0.02, rely=0.514,  relwidth=0.958)
+
+    self.TSeparator2 = ttk.Separator(self.Canvas1)
+    self.TSeparator2.place(relx=0.508, rely=0.016,  relheight=0.981)
+    self.TSeparator2.configure(orient="vertical")
+
+    self.style.configure('Treeview',  font="TkDefaultFont")
+    
+    # Create a treeview
+    self.Scrolledtreeview1 = ScrolledTreeView(top)    
+    self.Scrolledtreeview1.place(relx=0.008, rely=0.006, relheight=0.98, relwidth=0.289)
+
+    # build_treeview_support starting.
+    self.Scrolledtreeview1.heading("#0",text="Unprioritized")
+    self.Scrolledtreeview1.heading("#0",anchor="center")
+    self.Scrolledtreeview1.column("#0",width="200")
+    self.Scrolledtreeview1.column("#0",minwidth="120")
+    self.Scrolledtreeview1.column("#0",stretch="1")
+    self.Scrolledtreeview1.column("#0",anchor="w")
+    
+    # adding data
+    self.Scrolledtreeview1.insert('', tk.END, text='Administration', iid=0, open=True)
+    self.Scrolledtreeview1.insert('', tk.END, text='Logistics', iid=1, open=True)
+    self.Scrolledtreeview1.insert('', tk.END, text='Sales', iid=2, open=True)
+    self.Scrolledtreeview1.insert('', tk.END, text='Finance', iid=3, open=True)
+    self.Scrolledtreeview1.insert('', tk.END, text='IT', iid=4, open=True)
+
+    # adding children of first node
+    self.Scrolledtreeview1.insert('', tk.END, text='John 1',
+      iid=5, open=False, values=("Big2","Best"), tags=("treeitem",))
+      
+    self.Scrolledtreeview1.insert('', tk.END, text='Jane 2',
+       iid=6, open=False, values=("Big2","Best"))
+    self.Scrolledtreeview1.insert('', tk.END, text='Jane 3',
+       iid=7, open=False, values=("Big2","Best"))
+       
+    # add iid 5 to iid 0 (parent) into position n
+    self.Scrolledtreeview1.move(5, 2, 0)
+    self.Scrolledtreeview1.move(6, 2, 1)
+    self.Scrolledtreeview1.move(7, 2, 0)
+    
+    self.Scrolledtreeview1.tag_bind("treeitem", "<ButtonPress-1>", self.drag_start)
+    
+  def create_token(self, x, y, color):
+      """Create a token at the given coordinate in the given color"""
+      self.Canvas1.create_oval(
+          x - 25,
+          y - 25,
+          x + 25,
+          y + 25,
+          outline=color,
+          fill=color,
+          tags=("token",),
+      )
+
+  def drag_start(self, event):
+    """Begining drag of an object"""
+    print("drag_start")
+    # record the item and its location
+    self._drag_data["item"] = self.Canvas1.find_closest(event.x, event.y)[0]
+    self._drag_data["x"] = event.x
+    self._drag_data["y"] = event.y
+
+  def drag_stop(self, event):
+      """End drag of an object"""
+      # reset the drag information
+      self._drag_data["item"] = None
+      self._drag_data["x"] = 0
+      self._drag_data["y"] = 0
+
+  def drag(self, event):
+      """Handle dragging of an object"""
+      # compute how much the mouse has moved
+      delta_x = event.x - self._drag_data["x"]
+      delta_y = event.y - self._drag_data["y"]
+      # move the object the appropriate amount
+      self.Canvas1.move(self._drag_data["item"], delta_x, delta_y)
+      # record the new position
+      self._drag_data["x"] = event.x
+      self._drag_data["y"] = event.y
+      
 
 # The following code is added to facilitate the Scrolled widgets you specified.
 class AutoScroll(object):
-    '''Configure the scrollbars for a widget.'''
-    def __init__(self, master):
-        #  Rozen. Added the try-except clauses so that this class
-        #  could be used for scrolled entry widget for which vertical
-        #  scrolling is not supported. 5/7/14.
-        try:
-            vsb = ttk.Scrollbar(master, orient='vertical', command=self.yview)
-        except:
-            pass
-        hsb = ttk.Scrollbar(master, orient='horizontal', command=self.xview)
-        try:
-            self.configure(yscrollcommand=self._autoscroll(vsb))
-        except:
-            pass
-        self.configure(xscrollcommand=self._autoscroll(hsb))
-        self.grid(column=0, row=0, sticky='nsew')
-        try:
-            vsb.grid(column=1, row=0, sticky='ns')
-        except:
-            pass
-        hsb.grid(column=0, row=1, sticky='ew')
-        master.grid_columnconfigure(0, weight=1)
-        master.grid_rowconfigure(0, weight=1)
-        # Copy geometry methods of master  (taken from ScrolledText.py)
-        if py3:
-            methods = tk.Pack.__dict__.keys() | tk.Grid.__dict__.keys() \
-                  | tk.Place.__dict__.keys()
-        else:
-            methods = tk.Pack.__dict__.keys() + tk.Grid.__dict__.keys() \
-                  + tk.Place.__dict__.keys()
-        for meth in methods:
-            if meth[0] != '_' and meth not in ('config', 'configure'):
-                setattr(self, meth, getattr(master, meth))
+  '''Configure the scrollbars for a widget.'''
+  def __init__(self, master):
+    #  Rozen. Added the try-except clauses so that this class
+    #  could be used for scrolled entry widget for which vertical
+    #  scrolling is not supported. 5/7/14.
+    try:
+      vsb = ttk.Scrollbar(master, orient='vertical', command=self.yview)
+    except:
+      pass
+    hsb = ttk.Scrollbar(master, orient='horizontal', command=self.xview)
+    try:
+      self.configure(yscrollcommand=self._autoscroll(vsb))
+    except:
+      pass
+    self.configure(xscrollcommand=self._autoscroll(hsb))
+    self.grid(column=0, row=0, sticky='nsew')
+    try:
+      vsb.grid(column=1, row=0, sticky='ns')
+    except:
+      pass
+    hsb.grid(column=0, row=1, sticky='ew')
+    master.grid_columnconfigure(0, weight=1)
+    master.grid_rowconfigure(0, weight=1)
+    # Copy geometry methods of master  (taken from ScrolledText.py)
+    if py3:
+      methods = tk.Pack.__dict__.keys() | tk.Grid.__dict__.keys() \
+        | tk.Place.__dict__.keys()
+    else:
+      methods = tk.Pack.__dict__.keys() + tk.Grid.__dict__.keys() \
+        + tk.Place.__dict__.keys()
+    for meth in methods:
+      if meth[0] != '_' and meth not in ('config', 'configure'):
+        setattr(self, meth, getattr(master, meth))
 
-    @staticmethod
-    def _autoscroll(sbar):
-        '''Hide and show scrollbar as needed.'''
-        def wrapped(first, last):
-            first, last = float(first), float(last)
-            if first <= 0 and last >= 1:
-                sbar.grid_remove()
-            else:
-                sbar.grid()
-            sbar.set(first, last)
-        return wrapped
-
-    def __str__(self):
-        return str(self.master)
-
-def _create_container(func):
-    '''Creates a ttk Frame with a given master, and use this new frame to
-    place the scrollbars and the widget.'''
-    def wrapped(cls, master, **kw):
-        container = ttk.Frame(master)
-        container.bind('<Enter>', lambda e: _bound_to_mousewheel(e, container))
-        container.bind('<Leave>', lambda e: _unbound_to_mousewheel(e, container))
-        return func(cls, container, **kw)
+  @staticmethod
+  def _autoscroll(sbar):
+    '''Hide and show scrollbar as needed.'''
+    def wrapped(first, last):
+      first, last = float(first), float(last)
+      if first <= 0 and last >= 1:
+        sbar.grid_remove()
+      else:
+        sbar.grid()
+      sbar.set(first, last)
     return wrapped
 
+  def __str__(self):
+    return str(self.master)
+
+
+def _create_container(func):
+  '''Creates a ttk Frame with a given master, and use this new frame to
+  place the scrollbars and the widget.'''
+  def wrapped(cls, master, **kw):
+    container = ttk.Frame(master)
+    container.bind('<Enter>', lambda e: _bound_to_mousewheel(e, container))
+    container.bind('<Leave>', lambda e: _unbound_to_mousewheel(e, container))
+    return func(cls, container, **kw)
+  return wrapped
+
+
 class ScrolledTreeView(AutoScroll, ttk.Treeview):
-    '''A standard ttk Treeview widget with scrollbars that will
-    automatically show/hide as needed.'''
-    @_create_container
-    def __init__(self, master, **kw):
-        ttk.Treeview.__init__(self, master, **kw)
-        AutoScroll.__init__(self, master)
+  '''A standard ttk Treeview widget with scrollbars that will
+  automatically show/hide as needed.'''
+  @_create_container
+  def __init__(self, master, **kw):
+    ttk.Treeview.__init__(self, master, **kw)
+    AutoScroll.__init__(self, master)
+
 
 import platform
 def _bound_to_mousewheel(event, widget):
@@ -196,6 +278,7 @@ def _bound_to_mousewheel(event, widget):
         child.bind_all('<Shift-Button-4>', lambda e: _on_shiftmouse(e, child))
         child.bind_all('<Shift-Button-5>', lambda e: _on_shiftmouse(e, child))
 
+
 def _unbound_to_mousewheel(event, widget):
     if platform.system() == 'Windows' or platform.system() == 'Darwin':
         widget.unbind_all('<MouseWheel>')
@@ -205,6 +288,7 @@ def _unbound_to_mousewheel(event, widget):
         widget.unbind_all('<Button-5>')
         widget.unbind_all('<Shift-Button-4>')
         widget.unbind_all('<Shift-Button-5>')
+
 
 def _on_mousewheel(event, widget):
     if platform.system() == 'Windows':
@@ -216,6 +300,7 @@ def _on_mousewheel(event, widget):
             widget.yview_scroll(-1, 'units')
         elif event.num == 5:
             widget.yview_scroll(1, 'units')
+
 
 def _on_shiftmouse(event, widget):
     if platform.system() == 'Windows':
