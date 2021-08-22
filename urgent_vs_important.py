@@ -5,7 +5,7 @@
 #  in conjunction with Tcl version 8.6
 #    Aug 21, 2021 06:26:23 PM -05  platform: Darwin
 
-import sys
+import sys, time
 
 try:
     import Tkinter as tk
@@ -26,7 +26,18 @@ except ImportError:
 #logger.setLevel(logging.DEBUG)
 
 import urgent_vs_important_support
+import tasks_api
 
+colors = ['blue',
+  'orange',
+  'green',
+  'red',
+  'purple',
+  'brown',
+  'pink',
+  'gray',
+  'olive',
+  'cyan']
 
 def vp_start_gui():
     '''Starting point when module is the main routine.'''
@@ -100,20 +111,6 @@ class Toplevel1:
     self.Canvas1.configure(relief="ridge")
     self.Canvas1.configure(selectbackground="blue")
     self.Canvas1.configure(selectforeground="white")
-    
-    # this data is used to keep track of an
-    # item being dragged
-    self._drag_data = {"x": 0, "y": 0, "item": None}
-
-    # create a couple of movable objects
-    self.create_token(100, 100, "white", "White")
-    self.create_token(200, 100, "blue", "Blue")
-    
-    # add bindings for clicking, dragging and releasing over
-    # any object with the "token" tag
-    self.Canvas1.tag_bind("token", "<ButtonPress-1>", self.drag_start)
-    self.Canvas1.tag_bind("token", "<ButtonRelease-1>", self.drag_stop)
-    self.Canvas1.tag_bind("token", "<B1-Motion>", self.drag)
 
     self.TSeparator1 = ttk.Separator(self.Canvas1)
     self.TSeparator1.place(relx=0.02, rely=0.514,  relwidth=0.958)
@@ -136,31 +133,42 @@ class Toplevel1:
     self.Scrolledtreeview1.column("#0",stretch="1")
     self.Scrolledtreeview1.column("#0",anchor="w")
     
-    # adding data
-    self.Scrolledtreeview1.insert('', tk.END, text='Administration', iid=0, open=True, tags = ('oddrow',))
-    self.Scrolledtreeview1.insert('', tk.END, text='Logistics', iid=1, open=True)
-    self.Scrolledtreeview1.insert('', tk.END, text='Sales', iid=2, open=True)
-    self.Scrolledtreeview1.insert('', tk.END, text='Finance', iid=3, open=True)
-    self.Scrolledtreeview1.insert('', tk.END, text='IT', iid=4, open=True)
-    
-    # color all the entries with tag
-    self.Scrolledtreeview1.tag_configure('oddrow', foreground='orange')
+    print("loading data")
+    myTasks = tasks_api.getGoogleTasks("Test") # pass a specific tasklist for testing
 
-    # adding children of first node
-    self.Scrolledtreeview1.insert('', tk.END, text='John 1',
-      iid=5, open=False, values=("Big2","Best"), tags=("treeitem",))
-      
-    self.Scrolledtreeview1.insert('', tk.END, text='Jane 2',
-       iid=6, open=False, values=("Big2","Best"))
-       
-    self.Scrolledtreeview1.insert('', tk.END, text='Jane 3',
-       iid=7, open=False, values=("Big2","Best"))
-       
-    # add iid 5 to iid 0 (parent) into position n
-    self.Scrolledtreeview1.move(5, 2, 0)
-    self.Scrolledtreeview1.move(6, 2, 1)
-    self.Scrolledtreeview1.move(7, 2, 0)
+    color_index = 0
+    list_index = 0
+    parent_index = 0
+    # adding parents
+    for key in myTasks.keys():
+      print (f"{key} has {len(myTasks[key])} tasks")
+      self.Scrolledtreeview1.insert(
+        '', tk.END, text=key, iid=list_index, open=True, tags=(colors[color_index], 'list_name') )
+      parent_index = list_index
+      list_index += 1
+      # adding children sorted by key
+      for position in sorted(myTasks[key].keys()):
+        # TODO: if the task has no position - add it to the tree, otherwise add it to the canvas
+        self.Scrolledtreeview1.insert('', tk.END, text=myTasks[key][position]['title'],
+          iid=list_index, open=False, tags=(colors[color_index], 'task') ) # , values=("Big2","Best")
+        self.Scrolledtreeview1.move(list_index, parent_index, list_index)
+        list_index += 1
     
+      # color all the entries with tag
+      self.Scrolledtreeview1.tag_configure(colors[color_index], foreground=colors[color_index])
+      color_index += 1
+    
+    # this data is used to keep track of an
+    # item being dragged
+    self._drag_data = {"x": 0, "y": 0, "item": None}
+    
+    # add bindings for clicking, dragging and releasing over
+    # any object with the "token" tag
+    self.Canvas1.tag_bind("token", "<ButtonPress-1>", self.drag_start)
+    self.Canvas1.tag_bind("token", "<ButtonRelease-1>", self.drag_stop)
+    self.Canvas1.tag_bind("token", "<B1-Motion>", self.drag)
+    
+    # bind drag and drop events to the entire list
     # https://stackoverflow.com/questions/6740855/board-drawing-code-to-move-an-oval/6789351#6789351
     self.Scrolledtreeview1.bind("<ButtonPress-1>", self.tree_drag_start)
     self.Scrolledtreeview1.bind("<ButtonRelease-1>", self.tree_drag_stop)
@@ -180,6 +188,7 @@ class Toplevel1:
           tags=("token",),
       )
       self.Canvas1.create_text(x, y, text=text, tags=("token",))
+      
 
   def drag_start(self, event):
     """Begining drag of an object"""
@@ -208,7 +217,6 @@ class Toplevel1:
 
 
   def drag(self, event):
-    """Handle dragging of an object"""
     # compute how much the mouse has moved
     delta_x = event.x - self._drag_data["x"]
     delta_y = event.y - self._drag_data["y"]
@@ -217,13 +225,12 @@ class Toplevel1:
     # record the new position
     self._drag_data["x"] = event.x
     self._drag_data["y"] = event.y
-    print(f"drag: {self._drag_data['item']} x={event.x}, y={event.y}")
-    
+   
     
   def move_token(self, token_item, delta_x, delta_y):
     if (token_item % 2) == 0:
       token_item -= 1
-    print(f"moving {token_item} and {token_item+1} by {delta_x}, {delta_y}")
+    #print(f"moving {token_item} and {token_item+1} by {delta_x}, {delta_y}")
     self.Canvas1.move(token_item, delta_x, delta_y)
     self.Canvas1.move(token_item+1, delta_x, delta_y)
     
@@ -232,10 +239,6 @@ class Toplevel1:
     # record the item and its location
     self._drag_data["x"] = event.x
     self._drag_data["y"] = event.y
-    print(f"starting to drag the tree item {self.Scrolledtreeview1.focus()}")
-    
-    selected_task = self.Scrolledtreeview1.item(self.Scrolledtreeview1.focus())
-    print(selected_task)
     
     # change the cursor to hand
     self.Scrolledtreeview1.configure(cursor="hand")
@@ -243,12 +246,14 @@ class Toplevel1:
 
 
   def tree_drag_stop(self, event):
-    """End drag of an object"""
+    print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
+    # recrord the new position in the task
+    
     # reset the drag information
     self._drag_data["item"] = None
     self._drag_data["x"] = 0
     self._drag_data["y"] = 0
-    print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
+    
     
     #change the cursor back to arrow
     self.Scrolledtreeview1.configure(cursor="arrow")
@@ -263,29 +268,24 @@ class Toplevel1:
     if event.x > tree_width and not self._drag_data["item"]:
       # get the text from the currently selected task
       selected_task = self.Scrolledtreeview1.item(self.Scrolledtreeview1.focus())
-      # and create a token with its name
-      self.create_token(1, event.y, 'orange', selected_task['text'])
-      self._drag_data["item"] = self.Canvas1.find_closest(0, event.y)[0] - 1
-      # then remove the task from the list
-      self.Scrolledtreeview1.delete(self.Scrolledtreeview1.selection()[0] )
+      # check to make sure it is a task, and not a 'list_name'
+      if len(selected_task['tags']) > 1 and selected_task['tags'][1] == 'task':
+        # and create a token with its name
+        self.create_token(1, event.y, selected_task['tags'][0], selected_task['text'])
+        self._drag_data["item"] = self.Canvas1.find_closest(0, event.y)[0] - 1
+        # then remove the task from the list
+        self.Scrolledtreeview1.delete(self.Scrolledtreeview1.selection()[0] )
       
-    if event.x > tree_width: # move the object past the boundary
-      print(f"{event.x}>{tree_width}")
-    
+    if event.x > tree_width and self._drag_data["item"]: # move the object past the boundary    
       # compute how much the mouse has moved
       delta_x = event.x - self._drag_data["x"]
       delta_y = event.y - self._drag_data["y"]
-      
       # move the token by that much
       self.move_token(self._drag_data["item"], delta_x, delta_y)
     
     # record the new mouse position
     self._drag_data["x"] = event.x
     self._drag_data["y"] = event.y
-      
-
-    print(f"drag: {self._drag_data['item']} x={event.x}, y={event.y}")
-    
     
     
 

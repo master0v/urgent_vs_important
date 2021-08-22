@@ -13,7 +13,7 @@ from google.oauth2.credentials import Credentials
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/tasks.readonly']
 
-def getGoogleTasks():
+def getGoogleTasks(taskList=None):
 
   creds = None
   # The file token.json stores the user's access and refresh tokens, and is
@@ -37,8 +37,14 @@ def getGoogleTasks():
   results = service.tasklists().list(maxResults=100).execute()
   
   user_tasks = {}
+  
   task_lists = results.get('items', [])
   for task_list in task_lists:
+    # if task list name is passed, skip all the others
+    if taskList and task_list['title'] != taskList:
+      print(f"Skipping task list {task_list['title']}")
+      continue
+      
     user_tasks[task_list['title']] = {}
     #print(task_list)
     #input("\n")
