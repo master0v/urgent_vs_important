@@ -1,6 +1,7 @@
 
 
 # working sample from https://developers.google.com/tasks/quickstart/python
+#   pip3 install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 from __future__ import print_function
 import os.path
@@ -12,10 +13,8 @@ from google.oauth2.credentials import Credentials
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/tasks.readonly']
 
-def main():
-  """Shows basic usage of the Tasks API.
-  Prints the title and ID of the first 10 task lists.
-  """
+def getGoogleTasks():
+
   creds = None
   # The file token.json stores the user's access and refresh tokens, and is
   # created automatically when the authorization flow completes for the first
@@ -35,51 +34,49 @@ def main():
       token.write(creds.to_json())
 
   service = build('tasks', 'v1', credentials=creds)
-
-  # Call the Tasks API
-  results = service.tasklists().list(maxResults=10).execute()
+  results = service.tasklists().list(maxResults=100).execute()
+  
+  user_tasks = {}
   task_lists = results.get('items', [])
-
-  if not task_lists:
-    print('No task lists found.')
-  else:
-    #print('Task lists:')
-    for task_list in task_lists:
-      print("")
-      #print(task_list)
-      #input("Press Enter to continue...")
+  for task_list in task_lists:
+    user_tasks[task_list['title']] = {}
+    #print(task_list)
+    #input("\n")
+    
+    # get tasks from the list using paging
+    nextPageToken = ""
+    while True:
+      result = service.tasks().list(tasklist=task_list['id'], maxResults=100,
+        pageToken=nextPageToken).execute()
       
-      # get tasks from the list using paging
-      nextPageToken = ""
-      while True:
-        result = service.tasks().list(tasklist=task_list['id'], maxResults=100,
-          pageToken=nextPageToken).execute()
+      tasks = result.get('items', [])
+      for task in tasks:
+        user_tasks[task_list['title']][int(task['position'])] = task
+        task_status = '📦' if (task['status'] == 'needsAction') else '✅'
+        #print(f" {int(task['position'])}: {task['title']} {task_status}")
+        #print(task)
+        #input("\n")
+      
+      # check if we've reached the end of results
+      nextPageToken = result.get('nextPageToken', [])
+      if not nextPageToken:
+        break
         
-        tasks = result.get('items', [])
-        if not tasks:
-          print(' No tasks found in this list')
-        else:
-          print(f"{task_list['title']}, {len(tasks)}")
-          print("=================")
-          for task in tasks:
-            task_status = '📦' if (task['status'] == 'needsAction') else '✅'
-            #print(f"{int(task['position'])}: {task['title']} {task_status}")
-            #print(task)
-            #input("\nPress Enter to continue...\n")
-        
-        # check if we've reached the end of results
-        nextPageToken = result.get('nextPageToken', [])
-        if not nextPageToken:
-          break
-          
-      
-      
-      #result = service.tasks().move(tasklist='@default', task='taskID', parent='parentTaskID', previous='previousTaskID').execute()
+  return user_tasks
 
-      # Print the new values.
-      #print result['parent']
-      #print result['position']
-      #tasks = 
+
+def updateGoogleTask(taskID, updatedValues):
+      
+  #result = service.tasks().move(tasklist='@default', task='taskID', parent='parentTaskID', previous='previousTaskID').execute()
+
+  # Print the new values.
+  #print result['parent']
+  #print result['position']
+  #tasks = 
+  return
+  
 
 if __name__ == '__main__':
-  main()
+  myTasks = getGoogleTasks()
+  for key in myTasks.keys() :
+    print (f"{key} has {len(myTasks[key])} tasks")
