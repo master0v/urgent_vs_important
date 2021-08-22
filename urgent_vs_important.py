@@ -191,12 +191,10 @@ class Toplevel1:
       
 
   def drag_start(self, event):
-    """Begining drag of an object"""
     # record the item and its location
     self._drag_data["item"] = self.Canvas1.find_closest(event.x, event.y)[0]
     self._drag_data["x"] = event.x
     self._drag_data["y"] = event.y
-    print(f"start: {self._drag_data['item']} x={event.x}, y={event.y}")
     
     # change the cursor to hand
     self.Scrolledtreeview1.configure(cursor="hand")
@@ -204,12 +202,13 @@ class Toplevel1:
 
 
   def drag_stop(self, event):
-    """End drag of an object"""
+    print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
+    
     # reset the drag information
     self._drag_data["item"] = None
     self._drag_data["x"] = 0
     self._drag_data["y"] = 0
-    print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
+    
     
     #change the cursor back to arrow
     self.Scrolledtreeview1.configure(cursor="arrow")
@@ -217,6 +216,11 @@ class Toplevel1:
 
 
   def drag(self, event):
+    # do not allow dragging outside of the canvas
+    if event.x > self.Canvas1.winfo_width() or event.x < 0 or \
+      event.y > self.Canvas1.winfo_height() or event.y < 0:
+      return
+    
     # compute how much the mouse has moved
     delta_x = event.x - self._drag_data["x"]
     delta_y = event.y - self._drag_data["y"]
@@ -275,8 +279,11 @@ class Toplevel1:
         self._drag_data["item"] = self.Canvas1.find_closest(0, event.y)[0] - 1
         # then remove the task from the list
         self.Scrolledtreeview1.delete(self.Scrolledtreeview1.selection()[0] )
-      
-    if event.x > tree_width and self._drag_data["item"]: # move the object past the boundary    
+
+     # Do not alow moving outside the canvas boundary
+    if event.x > tree_width and self._drag_data["item"] and \
+      event.x < self.Canvas1.winfo_width() + tree_width and \
+      event.y < self.Canvas1.winfo_height() and event.y > 0 :   
       # compute how much the mouse has moved
       delta_x = event.x - self._drag_data["x"]
       delta_y = event.y - self._drag_data["y"]
