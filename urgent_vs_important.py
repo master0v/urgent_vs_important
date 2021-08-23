@@ -148,6 +148,11 @@ class Toplevel1:
       list_index += 1
       # adding children sorted by key
       for position in sorted(myTasks[key].keys()):
+        #print(f"\n==\n{myTasks[key][position]}\n")
+        #print(f"status: {myTasks[key][position].get('status')}")
+        #print(f"notes : {myTasks[key][position].get('notes')}")
+        #print(f"links : {myTasks[key][position].get('links')}")
+        
         # TODO: if the task has no position - add it to the tree, otherwise add it to the canvas
         self.Scrolledtreeview1.insert('', tk.END, text=myTasks[key][position]['title'],
           iid=list_index, open=False, tags=(colors[color_index], 'task') ) # , values=("Big2","Best")
@@ -157,6 +162,10 @@ class Toplevel1:
       # color all the entries with tag
       self.Scrolledtreeview1.tag_configure(colors[color_index], foreground=colors[color_index])
       color_index += 1
+      
+    task = myTasks["Test"][2]
+    task['notes'] = "test update\n\n[x=123,y=12]"
+    tasks_api.updateGoogleTaskNotes("cFgwb3p2VTIzR3dUZWVvNg", task)
     
     # this data is used to keep track of an
     # item being dragged
@@ -416,7 +425,7 @@ def _on_shiftmouse(event, widget):
             widget.xview_scroll(1, 'units')
 
 if __name__ == '__main__':
-    vp_start_gui()
+  vp_start_gui()
 
 
 

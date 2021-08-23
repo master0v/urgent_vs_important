@@ -1,6 +1,7 @@
 
 
 # working sample from https://developers.google.com/tasks/quickstart/python
+# referenc https://developers.google.com/tasks/reference/rest/v1/tasks/update
 #   pip3 install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 from __future__ import print_function
@@ -11,33 +12,33 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 # If modifying these scopes, delete the file token.json.
-SCOPES = ['https://www.googleapis.com/auth/tasks.readonly']
+SCOPES = ['https://www.googleapis.com/auth/tasks'] # tasks.readonly
+
+
+creds = None
+# The file token.json stores the user's access and refresh tokens, and is
+# created automatically when the authorization flow completes for the first
+# time.
+if os.path.exists('token.json'):
+  creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+# If there are no (valid) credentials available, let the user log in.
+if not creds or not creds.valid:
+  if creds and creds.expired and creds.refresh_token:
+    creds.refresh(Request())
+  else:
+    flow = InstalledAppFlow.from_client_secrets_file(
+      'credentials.json', SCOPES)
+    creds = flow.run_local_server(port=0)
+    # Save the credentials for the next run
+  with open('token.json', 'w') as token:
+    token.write(creds.to_json())
+    
+service = build('tasks', 'v1', credentials=creds)
 
 def getGoogleTasks(taskList=None):
 
-  creds = None
-  # The file token.json stores the user's access and refresh tokens, and is
-  # created automatically when the authorization flow completes for the first
-  # time.
-  if os.path.exists('token.json'):
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-  # If there are no (valid) credentials available, let the user log in.
-  if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-      creds.refresh(Request())
-    else:
-      flow = InstalledAppFlow.from_client_secrets_file(
-        'credentials.json', SCOPES)
-      creds = flow.run_local_server(port=0)
-      # Save the credentials for the next run
-    with open('token.json', 'w') as token:
-      token.write(creds.to_json())
-
-  service = build('tasks', 'v1', credentials=creds)
-  results = service.tasklists().list(maxResults=100).execute()
-  
   user_tasks = {}
-  
+  results = service.tasklists().list(maxResults=100).execute()
   task_lists = results.get('items', [])
   for task_list in task_lists:
     # if task list name is passed, skip all the others
@@ -58,7 +59,7 @@ def getGoogleTasks(taskList=None):
       tasks = result.get('items', [])
       for task in tasks:
         user_tasks[task_list['title']][int(task['position'])] = task
-        task_status = '📦' if (task['status'] == 'needsAction') else '✅'
+        #task_status = '📦' if (task['status'] == 'needsAction') else '✅'
         #print(f" {int(task['position'])}: {task['title']} {task_status}")
         #print(task)
         #input("\n")
@@ -71,7 +72,12 @@ def getGoogleTasks(taskList=None):
   return user_tasks
 
 
-def updateGoogleTask(taskID, updatedValues):
+def updateGoogleTaskNotes(listID, task):
+  print(f"Updating list {listID}, task {task['id']}") # ['id']
+  #result = service.tasks().update(tasklist='@default', task=task['id'], body=task).execute()
+  result = service.tasks().update(tasklist=listID, task=task['id'], body=task).execute()
+  
+  
       
   #result = service.tasks().move(tasklist='@default', task='taskID', parent='parentTaskID', previous='previousTaskID').execute()
 
@@ -79,7 +85,7 @@ def updateGoogleTask(taskID, updatedValues):
   #print result['parent']
   #print result['position']
   #tasks = 
-  return
+  return result
   
 
 if __name__ == '__main__':
