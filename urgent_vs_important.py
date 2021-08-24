@@ -26,7 +26,7 @@ except ImportError:
 #logger.setLevel(logging.DEBUG)
 
 import urgent_vs_important_support
-import tasks_api
+from tasks_api import GoogleTasks
 
 colors = ['blue',
   'orange',
@@ -133,39 +133,38 @@ class Toplevel1:
     self.Scrolledtreeview1.column("#0",stretch="1")
     self.Scrolledtreeview1.column("#0",anchor="w")
     
-    print("loading data")
-    myTasks = tasks_api.getGoogleTasks("Test") # pass a specific tasklist for testing
+    print("loading tasks from your google account")
+    self.gt = GoogleTasks()
+    self.myTasks = self.gt.getTasks("Test") # pass a specific tasklist for testing
 
     color_index = 0
     list_index = 0
     parent_index = 0
     # adding parents
-    for key in myTasks.keys():
-      print (f"{key} has {len(myTasks[key])} tasks")
+    for key in self.myTasks.keys():
+      print (f"{key} has {len(self.myTasks[key])} tasks")
       self.Scrolledtreeview1.insert(
         '', tk.END, text=key, iid=list_index, open=True, tags=(colors[color_index], 'list_name') )
       parent_index = list_index
       list_index += 1
       # adding children sorted by key
-      for position in sorted(myTasks[key].keys()):
-        #print(f"\n==\n{myTasks[key][position]}\n")
-        #print(f"status: {myTasks[key][position].get('status')}")
-        #print(f"notes : {myTasks[key][position].get('notes')}")
-        #print(f"links : {myTasks[key][position].get('links')}")
-        
-        # TODO: if the task has no position - add it to the tree, otherwise add it to the canvas
-        self.Scrolledtreeview1.insert('', tk.END, text=myTasks[key][position]['title'],
-          iid=list_index, open=False, tags=(colors[color_index], 'task') ) # , values=("Big2","Best")
-        self.Scrolledtreeview1.move(list_index, parent_index, list_index)
-        list_index += 1
+      for position in sorted(self.myTasks[key].keys()):
+        # get task coordinates
+        coords = self.myTasks[key][position].get('coordinates')
+        if not coords: # if the task has no position - add it to the tree
+          self.Scrolledtreeview1.insert('', tk.END, text=self.myTasks[key][position]['title'],
+            iid=list_index, open=False, tags=(colors[color_index], 'task') ) # , values=("Big2","Best")
+          self.Scrolledtreeview1.move(list_index, parent_index, list_index)
+          list_index += 1
+        else: # otherwise add it to the canvas
+          self.create_token(int(coords[0]), int(coords[1]),
+            colors[color_index], self.myTasks[key][position]['title'])
     
       # color all the entries with tag
       self.Scrolledtreeview1.tag_configure(colors[color_index], foreground=colors[color_index])
       color_index += 1
       
-    task = myTasks["Test"][2]
-    task['notes'] = "test update\n\n[x=123,y=12]"
-    tasks_api.updateGoogleTaskNotes("cFgwb3p2VTIzR3dUZWVvNg", task)
+
     
     # this data is used to keep track of an
     # item being dragged
@@ -212,6 +211,10 @@ class Toplevel1:
 
   def drag_stop(self, event):
     print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
+    
+    # Update task with coordinates, and load them on start
+    # based on that the GoogleTasks class will re-order them in the task list
+    self.gt.updateTaskCoodinates("Test", self.myTasks["Test"][2], event.x, event.y)
     
     # reset the drag information
     self._drag_data["item"] = None
@@ -261,6 +264,9 @@ class Toplevel1:
   def tree_drag_stop(self, event):
     print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
     # recrord the new position in the task
+    
+    #TODO: Update task notes with coordinates, and load them on start
+    
     
     # reset the drag information
     self._drag_data["item"] = None
