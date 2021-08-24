@@ -94,7 +94,6 @@ class Toplevel1:
     top.configure(background="#d9d9d9")
     top.configure(highlightbackground="#d9d9d9")
     top.configure(highlightcolor="black")
-    
 
     self.style.configure('TSizegrip', background=_bgcolor)
     self.TSizegrip1 = ttk.Sizegrip(top)
@@ -136,6 +135,8 @@ class Toplevel1:
     print("loading tasks from your google account")
     self.gt = GoogleTasks()
     self.myTasks = self.gt.getTasks("Test") # pass a specific tasklist for testing
+    
+    self.list_to_task = {}
 
     color_index = 0
     list_index = 0
@@ -153,18 +154,19 @@ class Toplevel1:
         coords = self.myTasks[key][position].get('coordinates')
         if not coords: # if the task has no position - add it to the tree
           self.Scrolledtreeview1.insert('', tk.END, text=self.myTasks[key][position]['title'],
-            iid=list_index, open=False, tags=(colors[color_index], 'task') ) # , values=("Big2","Best")
+            iid=list_index, open=False, tags=(colors[color_index], 'task') )
           self.Scrolledtreeview1.move(list_index, parent_index, list_index)
+          #self.myTasks[key][position]['list_index'] = list_index
+          self.list_to_task[list_index] = self.myTasks[key][position]
           list_index += 1
         else: # otherwise add it to the canvas
           self.create_token(int(coords[0]), int(coords[1]),
-            colors[color_index], self.myTasks[key][position]['title'])
+            colors[color_index], self.myTasks[key][position])
+        #print(f"\n{self.myTasks[key][position]}\n")
     
       # color all the entries with tag
       self.Scrolledtreeview1.tag_configure(colors[color_index], foreground=colors[color_index])
       color_index += 1
-      
-
     
     # this data is used to keep track of an
     # item being dragged
@@ -184,18 +186,22 @@ class Toplevel1:
     
     
     
-  def create_token(self, x, y, color, text):
-      """Create a token at the given coordinate in the given color"""
-      self.Canvas1.create_oval(
-          x - 35,
-          y - 15,
-          x + 35,
-          y + 15,
-          outline=color,
-          fill=color,
-          tags=("token",),
-      )
-      self.Canvas1.create_text(x, y, text=text, tags=("token",))
+  def create_token(self, x, y, color, task):
+    # Create a token at the given coordinate in the given color
+    token_id = self.Canvas1.create_oval(
+        x - 35,
+        y - 15,
+        x + 35,
+        y + 15,
+        outline=color,
+        fill=color,
+        tags=("token",),
+    )
+    # map this token_id to this task
+    self.gt.setTokenId(token_id, task)
+    # create the token text label
+    self.Canvas1.create_text(x, y, text=task['title'], tags=("token",))
+    
       
 
   def drag_start(self, event):
@@ -214,7 +220,9 @@ class Toplevel1:
     
     # Update task with coordinates, and load them on start
     # based on that the GoogleTasks class will re-order them in the task list
-    self.gt.updateTaskCoodinates("Test", self.myTasks["Test"][2], event.x, event.y)
+    
+    task = self.gt.getTaskByTokenId(self._drag_data['item'])
+    self.gt.updateTaskCoodinates(task, event.x, event.y)
     
     # reset the drag information
     self._drag_data["item"] = None
@@ -263,16 +271,19 @@ class Toplevel1:
 
   def tree_drag_stop(self, event):
     print(f"stop: {self._drag_data['item']} x={event.x}, y={event.y}")
-    # recrord the new position in the task
     
-    #TODO: Update task notes with coordinates, and load them on start
+    tree_width = self.Scrolledtreeview1.winfo_width()
     
+    # only if we created a new token in the process of a drag
+    if self._drag_data['item']:
+      # recrord the new position in the task
+      task = self.gt.getTaskByTokenId(self._drag_data['item'])
+      self.gt.updateTaskCoodinates(task, event.x - tree_width, event.y)
     
     # reset the drag information
     self._drag_data["item"] = None
     self._drag_data["x"] = 0
     self._drag_data["y"] = 0
-    
     
     #change the cursor back to arrow
     self.Scrolledtreeview1.configure(cursor="arrow")
@@ -290,7 +301,8 @@ class Toplevel1:
       # check to make sure it is a task, and not a 'list_name'
       if len(selected_task['tags']) > 1 and selected_task['tags'][1] == 'task':
         # and create a token with its name
-        self.create_token(1, event.y, selected_task['tags'][0], selected_task['text'])
+        task = self.list_to_task[int(self.Scrolledtreeview1.focus())]
+        self.create_token(1, event.y, selected_task['tags'][0], task)
         self._drag_data["item"] = self.Canvas1.find_closest(0, event.y)[0] - 1
         # then remove the task from the list
         self.Scrolledtreeview1.delete(self.Scrolledtreeview1.selection()[0] )

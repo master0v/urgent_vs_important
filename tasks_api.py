@@ -13,6 +13,7 @@ from google.oauth2.credentials import Credentials
 
 import re
 
+
 class GoogleTasks:
   
   def __init__(self):
@@ -36,10 +37,11 @@ class GoogleTasks:
         # Save the credentials for the next run
       with open('token.json', 'w') as token:
         token.write(creds.to_json())
-    
-    self.service = build('tasks', 'v1', credentials=creds)
-    self.taskID = {}
 
+    self.service = build('tasks', 'v1', credentials=creds)
+    self.token_list = {}
+
+  # === get all users google tasks, add additional fields to them, and return the pointer ==
 
   def getTasks(self, taskList=None):
 
@@ -47,7 +49,6 @@ class GoogleTasks:
     results = self.service.tasklists().list(maxResults=100).execute()
     task_lists = results.get('items', [])
     for task_list in task_lists:
-      self.taskID[task_list['title']] = task_list['id']
       # if task list name is passed, skip all the others
       if taskList and task_list['title'] != taskList:
         print(f"Skipping task list {task_list['title']}")
@@ -67,43 +68,62 @@ class GoogleTasks:
           coords=re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task['notes'], re.MULTILINE|re.DOTALL)
           if coords:
             task['coordinates'] = coords[0]
+          task['task_list_id'] = task_list['id']
           self.user_tasks[task_list['title']][int(task['position'])] = task
-      
+
         # check if we've reached the end of results
         nextPageToken = result.get('nextPageToken', [])
         if not nextPageToken:
           break
         
     return self.user_tasks
+    
+    
+  # ===
+  def setTokenId(self, token_id, task):
+    #print(f"Settings token {token_id}={task}")
+    self.token_list[token_id] = task
+  
+  def getTaskByTokenId(self, token_id:int):
+    if (token_id % 2) == 0:
+      token_id -= 1
+    return self.token_list.get(token_id)
+  # === update task with new coordinates ==
 
-
-  def updateTaskCoodinates(self, list_name, task, x, y):
-    listID = self.taskID[list_name]
-    print(f"Updating list {listID}, task {task['id']} with x={x}, y={y}") # ['id']
+  def updateTaskCoodinates(self, task, x, y):
+    if x < 0:
+      x = 0
+    if y < 0:
+      y = 0
+    print(f"Updating list {task['task_list_id']}, task {task['id']} with x={x}, y={y}") # ['id']
     notes = task.get('notes')
     new_coords=f"[x={x},y={y}]"
     if notes: # task already has notes
+      print("task already has notes")
       coords = re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task['notes'], re.MULTILINE|re.DOTALL)
       if (coords): # task already has coordinates
+        print("task already has coordinates {coords}")
         current_coords = f"[x={coords[0][0]},y={coords[0][1]}]"
         new_notes = notes.replace(current_coords, new_coords)
-      else: # task didn't have coordinates, add the at the end
+      else: # task didn't have coordinates, add them at the end
+        print("task didn't have coordinates, adding them at the end")
         new_notes = f"{notes}\n\n{new_coords}"
-    else: # task didn't have notes, notes with coordinates
+    else: # task didn't have notes, add new notes with coordinates
+      print("task didn't have notes, adding new notes with coordinates")
       new_notes = f"\n\n{new_coords}"
     
     task['notes'] = new_notes
-    result = self.service.tasks().update(tasklist=listID, task=task['id'], body=task).execute()
+    return self.service.tasks().update(tasklist=task['task_list_id'], task=task['id'], body=task).execute()
+    
+  # ===
   
-  
-      
     #result = service.tasks().move(tasklist='@default', task='taskID', parent='parentTaskID', previous='previousTaskID').execute()
 
     # Print the new values.
     #print result['parent']
     #print result['position']
     #tasks = 
-    return result
+    
   
 
 if __name__ == '__main__':
