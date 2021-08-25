@@ -1,7 +1,7 @@
 
 
 # working sample from https://developers.google.com/tasks/quickstart/python
-# referenc https://developers.google.com/tasks/reference/rest/v1/tasks/update
+# reference https://developers.google.com/tasks/reference/rest/v1/tasks/update
 #   pip3 install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 from __future__ import print_function
@@ -12,6 +12,8 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 import re
+
+SEPARATOR_TITLE = "----- above ^^^ prioritized -----"
 
 
 class GoogleTasks:
@@ -40,6 +42,7 @@ class GoogleTasks:
 
     self.service = build('tasks', 'v1', credentials=creds)
     self.token_list = {}
+    self.separators = {}
 
   # === get all users google tasks, add additional fields to them, and return the pointer ==
 
@@ -64,12 +67,20 @@ class GoogleTasks:
       
         tasks = result.get('items', [])
         for task in tasks:
-          # if the "notes" field contains coordinates, then extract them an populate the field
-          coords=re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task['notes'], re.MULTILINE|re.DOTALL)
-          if coords:
-            task['coordinates'] = coords[0]
           task['task_list_id'] = task_list['id']
-          self.user_tasks[task_list['title']][int(task['position'])] = task
+          # check if the task is a separator
+          if task.get('title') == SEPARATOR_TITLE:
+            # assign it to a separate list
+            self.separators[task_list['id']] = task
+          else: # normal task
+            # check if the notes field exists
+            task_notes = task.get('notes')
+            if task_notes:
+              # if the "notes" field contains coordinates, then extract them an populate the field
+              coords=re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task_notes, re.MULTILINE|re.DOTALL)
+              if coords:
+                task['coordinates'] = coords[0]
+            self.user_tasks[task_list['title']][int(task['position'])] = task
 
         # check if we've reached the end of results
         nextPageToken = result.get('nextPageToken', [])
@@ -88,6 +99,54 @@ class GoogleTasks:
     if (token_id % 2) == 0:
       token_id -= 1
     return self.token_list.get(token_id)
+    
+  
+  def weightBasedOnCoordinates(self, e):
+    # TODO: Replace 5000 with the actual canvas height
+    importance = 5000 - int(e['coordinates'][1])
+    urgency = int(e['coordinates'][0])
+    # importance is given an order of magnitude higher weight than urgency
+    return importance * 10 + urgency
+
+  # ===
+    
+  def moveTaskToTheTop(self, task):
+    return self.service.tasks().move(tasklist=task['task_list_id'], task=task['id']).execute()
+    #  previous=previous_task_id # previous_task_id=None
+    #result = service.tasks().move(tasklist='@default', task='taskID', parent='parentTaskID', previous='previousTaskID').execute()
+      
+  # ===
+  
+  def insertNewTaskAtTheTop(self, list_id, task):
+    return self.service.tasks().insert(tasklist=list_id, body=task).execute()
+    
+  # ===
+  
+  def sortPrioritizedTasks(self, list_id):
+    # self.token_list contains all tasks on the Canvas
+    # go over it and sort all the task according to their coordinates
+    prioritized_tasks = sorted(self.token_list.values(), key=self.weightBasedOnCoordinates)
+    
+    # for a givem list_id add prioritized/unprioritized separator at the bottom
+    separator_task = self.separators.get(list_id)
+    if separator_task:
+      self.moveTaskToTheTop(separator_task)
+    else: # create a new separator at the top
+      new_task = {}
+      new_task['kind'] = 'tasks#task'
+      new_task['title'] = '----- above ^^^ prioritized -----'
+      new_task['status'] = 'needsAction'
+      return_value = self.insertNewTaskAtTheTop(list_id, new_task)
+      return_value['task_list_id'] = list_id
+      # and remember it in the separator list for future refreshes
+      self.separators[list_id] = return_value
+    # go through all the tasks
+    for task in prioritized_tasks:
+      # and "touch" only the ones from this list
+      if task['task_list_id'] == list_id:
+        print(f"Moving '{task['title']}' to the top")
+        self.moveTaskToTheTop(task)
+    
   # === update task with new coordinates ==
 
   def updateTaskCoodinates(self, task, x, y):
@@ -96,24 +155,28 @@ class GoogleTasks:
     if y < 0:
       y = 0
     print(f"Updating list {task['task_list_id']}, task {task['id']} with x={x}, y={y}") # ['id']
+    # update coordinates in the data structure
+    task['coordinates'] = str(x), str(y)
+    # insert them in the notes, so that they are saved between reloads
     notes = task.get('notes')
     new_coords=f"[x={x},y={y}]"
     if notes: # task already has notes
-      print("task already has notes")
+      #print("task already has notes")
       coords = re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task['notes'], re.MULTILINE|re.DOTALL)
       if (coords): # task already has coordinates
-        print("task already has coordinates {coords}")
+        #print("task already has coordinates {coords}")
         current_coords = f"[x={coords[0][0]},y={coords[0][1]}]"
         new_notes = notes.replace(current_coords, new_coords)
       else: # task didn't have coordinates, add them at the end
-        print("task didn't have coordinates, adding them at the end")
+        #print("task didn't have coordinates, adding them at the end")
         new_notes = f"{notes}\n\n{new_coords}"
     else: # task didn't have notes, add new notes with coordinates
-      print("task didn't have notes, adding new notes with coordinates")
+      #print("task didn't have notes, adding new notes with coordinates")
       new_notes = f"\n\n{new_coords}"
-    
     task['notes'] = new_notes
-    return self.service.tasks().update(tasklist=task['task_list_id'], task=task['id'], body=task).execute()
+    self.service.tasks().update(tasklist=task['task_list_id'], task=task['id'], body=task).execute()
+    # re-order all the prioritized tasks accoring to the urgent/important algorithm
+    self.sortPrioritizedTasks(task['task_list_id'])
     
   # ===
   

@@ -134,7 +134,7 @@ class Toplevel1:
     
     print("loading tasks from your google account")
     self.gt = GoogleTasks()
-    self.myTasks = self.gt.getTasks("Test") # pass a specific tasklist for testing
+    self.myTasks = self.gt.getTasks() # "Test"
     
     self.list_to_task = {}
 
@@ -143,7 +143,7 @@ class Toplevel1:
     parent_index = 0
     # adding parents
     for key in self.myTasks.keys():
-      print (f"{key} has {len(self.myTasks[key])} tasks")
+      print (f"{key} has {len(self.myTasks[key])} tasks (not counting the separator)")
       self.Scrolledtreeview1.insert(
         '', tk.END, text=key, iid=list_index, open=True, tags=(colors[color_index], 'list_name') )
       parent_index = list_index
