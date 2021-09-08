@@ -12,6 +12,10 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 import re
+import logging
+logging.basicConfig(format='%(name)-8s: %(asctime)-10s %(levelname)-6s %(message)s')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 SEPARATOR_TITLE = "----- above ^^^ prioritized -----"
 
@@ -28,14 +32,28 @@ class GoogleTasks:
     # time.
     if os.path.exists('token.json'):
       creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+      logger.debug(f"Current token valid? {creds.valid}")
+      
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
+      logger.debug(f"Token Expired? {creds.expired}")
       if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-      else:
+        logger.debug(f"Refresh token: {creds.refresh_token}")
+        try:
+          ret_val = creds.refresh(Request())
+        except Exception as e:
+          logger.warning(f"Refresh token failed: {e}.")
+          creds = None
+
+      if not creds:
         flow = InstalledAppFlow.from_client_secrets_file(
           'credentials.json', SCOPES)
-        creds = flow.run_local_server(port=0)
+        while True:
+          try:
+            creds = flow.run_local_server(port=0)
+            break
+          except Exception as e:
+            logger.error(f"Please check 'Create, edit, organize, and delete all your tasks.'")
         # Save the credentials for the next run
       with open('token.json', 'w') as token:
         token.write(creds.to_json())
@@ -67,20 +85,22 @@ class GoogleTasks:
       
         tasks = result.get('items', [])
         for task in tasks:
-          task['task_list_id'] = task_list['id']
-          # check if the task is a separator
-          if task.get('title') == SEPARATOR_TITLE:
-            # assign it to a separate list
-            self.separators[task_list['id']] = task
-          else: # normal task
-            # check if the notes field exists
-            task_notes = task.get('notes')
-            if task_notes:
-              # if the "notes" field contains coordinates, then extract them an populate the field
-              coords=re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task_notes, re.MULTILINE|re.DOTALL)
-              if coords:
-                task['coordinates'] = coords[0]
-            self.user_tasks[task_list['title']][int(task['position'])] = task
+          # only ingest the tasks that are active
+          if task['status'] == 'needsAction':
+            task['task_list_id'] = task_list['id']
+            # check if the task is a separator
+            if task.get('title') == SEPARATOR_TITLE:
+              # assign it to a separate list
+              self.separators[task_list['id']] = task
+            else: # normal task
+              # check if the notes field exists
+              task_notes = task.get('notes')
+              if task_notes:
+                # if the "notes" field contains coordinates, then extract them an populate the field
+                coords=re.findall('.*\[x=([0-9]+),y=([0-9]+)\].*', task_notes, re.MULTILINE|re.DOTALL)
+                if coords:
+                  task['coordinates'] = coords[0]
+              self.user_tasks[task_list['title']][int(task['position'])] = task
 
         # check if we've reached the end of results
         nextPageToken = result.get('nextPageToken', [])
