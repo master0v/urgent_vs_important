@@ -28,6 +28,7 @@ class GoogleTasks:
         creds_path = os.path.join(here, 'credentials.json')
         token_path  = os.path.join(here, 'token.json')
 
+
         if os.path.exists(token_path):
             try:
                 creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -69,6 +70,7 @@ class GoogleTasks:
         self.token_list = {}
         self.separators = {}
         self.user_tasks = {}
+
 
     def getTasks(self, taskList=None):
         """
@@ -130,18 +132,31 @@ class GoogleTasks:
 
         return self.user_tasks
 
+
     def setTokenId(self, token_id, task):
         self.token_list[token_id] = task
 
+
     def getTaskByTokenId(self, token_id: int):
-        if (token_id % 2) == 0:
-            token_id -= 1
-        return self.token_list.get(token_id)
+        """
+        Be tolerant to different canvas item ids:
+        - Return by exact key if present.
+        - Otherwise try neighbors (old odd/even pairing logic).
+        """
+        t = self.token_list.get(token_id)
+        if t:
+            return t
+        t = self.token_list.get(token_id - 1)
+        if t:
+            return t
+        return self.token_list.get(token_id + 1)
+
 
     def weightBasedOnCoordinates(self, e):
         importance = 5000 - int(e['coordinates'][1])
         urgency = int(e['coordinates'][0])
         return importance * 10 + urgency
+
 
     def moveTaskToTheTop(self, task):
         return self.service.tasks().move(
@@ -151,8 +166,16 @@ class GoogleTasks:
     def insertNewTaskAtTheTop(self, list_id, task):
         return self.service.tasks().insert(tasklist=list_id, body=task).execute()
 
+
     def sortPrioritizedTasks(self, list_id):
-        prioritized_tasks = sorted(self.token_list.values(), key=self.weightBasedOnCoordinates)
+        # Deduplicate tasks by their Google Tasks id first, then sort
+        unique_by_id = {}
+        for t in self.token_list.values():
+            # Only keep tasks for this list
+            if t.get('task_list_id') == list_id:
+                unique_by_id[t['id']] = t
+
+        prioritized_tasks = sorted(unique_by_id.values(), key=self.weightBasedOnCoordinates)
 
         separator_task = self.separators.get(list_id)
         if separator_task:
@@ -168,9 +191,9 @@ class GoogleTasks:
             self.separators[list_id] = return_value
 
         for task in prioritized_tasks:
-            if task['task_list_id'] == list_id:
-                print(f"Moving '{task['title']}' to the top")
-                self.moveTaskToTheTop(task)
+            print(f"Moving '{task['title']}' to the top")
+            self.moveTaskToTheTop(task)
+
 
     def updateTaskCoodinates(self, task, x, y):
         if x < 0: x = 0
@@ -201,6 +224,7 @@ class GoogleTasks:
 
         # resort within list
         self.sortPrioritizedTasks(task['task_list_id'])
+
 
 if __name__ == '__main__':
     gt = GoogleTasks()
