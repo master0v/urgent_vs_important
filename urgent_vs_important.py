@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 #  -*- coding: utf-8 -*-
 
-import sys, time, os, json
+import sys, os, json
 from pathlib import Path
 
 try:
@@ -50,36 +50,26 @@ def destroy_Toplevel1():
 class Toplevel1:
 
     def __init__(self, top=None):
-        self.top = top  # keep handle to real window
-
+        self.top = top
         _bgcolor = '#d9d9d9'
         _fgcolor = '#000000'
-        _compcolor = '#d9d9d9'
-        _ana1color = '#d9d9d9'
         _ana2color = '#ececec'
         self.style = ttk.Style()
         if sys.platform == "win32":
             self.style.theme_use('winnative')
         self.style.configure('.', background=_bgcolor, foreground=_fgcolor, font="TkDefaultFont")
-        self.style.map('.', background=[('selected', _compcolor), ('active', _ana2color)])
+        self.style.map('.', background=[('selected', _bgcolor), ('active', _ana2color)])
 
-        # fullscreen state
         self._fullscreen = False
-
-        # Default geometry (overridden by saved settings if present)
         top.geometry("900x700+200+100")
         top.resizable(True, True)
         top.title("Prioritize!")
         top.configure(background=_bgcolor)
-        top.configure(highlightbackground=_bgcolor, highlightcolor="black")
 
-        # Fullscreen helpers
         top.bind("<F11>", lambda e: self.toggle_fullscreen())
         top.bind("<FocusIn>", self._enforce_fullscreen)
-        top.bind("<Map>", self._enforce_fullscreen)
-        top.bind("<Visibility>", self._enforce_fullscreen)
 
-        # --- Layout: resizable left pane via Panedwindow ---
+        # ---- Layout: left tree + right canvas-with-scrollbars ----
         self.paned = ttk.Panedwindow(top, orient=tk.HORIZONTAL)
         self.paned.place(relx=0.0, rely=0.0, relheight=1.0, relwidth=1.0)
 
@@ -88,59 +78,55 @@ class Toplevel1:
         self.paned.add(self.left_frame, weight=1)
         self.paned.add(self.right_frame, weight=3)
 
-        # Sizegrip
-        self.style.configure('TSizegrip', background=_bgcolor)
-        self.TSizegrip1 = ttk.Sizegrip(top)
-        self.TSizegrip1.place(anchor='se', relx=1.0, rely=1.0)
+        # Right side: container grid for canvas + scrollbars
+        self.canvas_container = ttk.Frame(self.right_frame)
+        self.canvas_container.pack(fill="both", expand=True, padx=4, pady=4)
+        self.canvas_container.grid_rowconfigure(0, weight=1)
+        self.canvas_container.grid_columnconfigure(0, weight=1)
 
-        # Canvas inside right frame
-        self.Canvas1 = tk.Canvas(self.right_frame)
-        self.Canvas1.pack(fill="both", expand=True, padx=4, pady=4)
-        self.Canvas1.configure(background=_bgcolor, borderwidth="2",
-                               highlightbackground=_bgcolor, highlightcolor="black",
-                               insertbackground="black", relief="ridge",
-                               selectbackground="blue", selectforeground="white")
+        self.Canvas1 = tk.Canvas(
+            self.canvas_container,
+            background=_bgcolor, borderwidth=2,
+            highlightbackground=_bgcolor, relief="ridge"
+        )
 
-        # Redraw axis labels on resize and initial placement
+        # Scrollbars wired directly to canvas (axes are drawn in canvas coords, so they scroll naturally)
+        self.hscroll = ttk.Scrollbar(self.canvas_container, orient='horizontal', command=self.Canvas1.xview)
+        self.vscroll = ttk.Scrollbar(self.canvas_container, orient='vertical', command=self.Canvas1.yview)
+        self.Canvas1.configure(xscrollcommand=self.hscroll.set, yscrollcommand=self.vscroll.set)
+
+        self.Canvas1.grid(row=0, column=0, sticky="nsew")
+        self.vscroll.grid(row=0, column=1, sticky="ns")
+        self.hscroll.grid(row=1, column=0, sticky="ew")
+
+        # Redraw axes when the visible size changes (center-of-canvas may need recompute if canvas grew)
         self.Canvas1.bind("<Configure>", self._on_canvas_resize)
-        self.Canvas1.bind("<Configure>", self._maybe_place_pending_tokens, add="+")
-
-        self.TSeparator1 = ttk.Separator(self.Canvas1)
-        self.TSeparator1.place(relx=0.02, rely=0.514, relwidth=0.958)
-
-        self.TSeparator2 = ttk.Separator(self.Canvas1)
-        self.TSeparator2.place(relx=0.508, rely=0.016, relheight=0.981)
-        self.TSeparator2.configure(orient="vertical")
 
         self.style.configure('Treeview', font="TkDefaultFont")
-
-        # Left tree view
         self.Scrolledtreeview1 = ScrolledTreeView(self.left_frame)
         self.Scrolledtreeview1.pack(fill="both", expand=True, padx=4, pady=4)
         self.Scrolledtreeview1.heading("#0", text="Unprioritized", anchor="center")
         self.Scrolledtreeview1.column("#0", width="220", minwidth="120", stretch=True, anchor="w")
 
-        # Load tasks
         print("loading tasks from your google account")
         self.gt = GoogleTasks()
-        self.myTasks = self.gt.getTasks()  # active only
+        self.myTasks = self.gt.getTasks()
 
         self.list_to_task = {}
-        # group-based dragging data
         self._drag_data = {"x": 0, "y": 0, "group": None, "rect_id": None, "moved": False}
 
-        # Queue tokens for later placement
-        self._pending_tokens = []     # [(x,y,color,task)]
+        self._pending_tokens = []
         self._initial_tokens_placed = False
-        self._placing_tokens = False  # re-entrancy guard
+        self._placing_tokens = False
 
-        # subtasks: cache and per-token panel state
-        self._subtasks_by_parent = {}  # { parent_task_id: [titles...] }
-        # { rect_id: {"expanded": bool, "ids": (panel_rect, panel_text) or None,
-        #             "icon": (icon_bg, icon_text) or None } }
+        self._subtasks_by_parent = {}
         self._subtask_panels = {}
+        self._token_widgets = {}
 
-        # === Build UI: tasks WITH coords -> canvas (deferred); WITHOUT -> tree ===
+        # Scrollregion content bounds [x0,y0,x1,y1]; x0=y0=0 in this app
+        self._content_bounds = None
+
+        # ===== Populate left + queue canvas tokens =====
         color_index = 0
         list_index = 0
 
@@ -148,16 +134,14 @@ class Toplevel1:
             tasks_map = self.myTasks[key]
             print(f"{key} has {len(tasks_map)} active tasks")
 
-            # list header
             self.Scrolledtreeview1.insert(
                 '', tk.END, text=key, iid=list_index, open=True, tags=(colors[color_index], 'list_name')
             )
             list_header_iid = list_index
             list_index += 1
 
-            # tasks with coordinates -> queue for exact placement
             canvas_parent_ids = set()
-            for pos in sorted(tasks_map.keys()):  # preserve API order
+            for pos in sorted(tasks_map.keys()):
                 t = tasks_map[pos]
                 coords = t.get('coordinates')
                 if coords:
@@ -166,7 +150,6 @@ class Toplevel1:
                     if t.get('id'):
                         canvas_parent_ids.add(t['id'])
 
-            # parents (no coordinates)
             id_to_iid = {}
             for pos in sorted(tasks_map.keys()):
                 t = tasks_map[pos]
@@ -181,7 +164,6 @@ class Toplevel1:
                     self.list_to_task[list_index] = t
                     list_index += 1
 
-            # subtasks (hide those whose parent is on canvas; cache for panel)
             for pos in sorted(tasks_map.keys()):
                 t = tasks_map[pos]
                 if t.get('coordinates'):
@@ -206,10 +188,10 @@ class Toplevel1:
             self.Scrolledtreeview1.tag_configure(colors[color_index], foreground=colors[color_index])
             color_index = (color_index + 1) % len(colors)
 
-        # Initial placement
+        # Initial placement (after Canvas has size)
         self.Canvas1.after(0, self._maybe_place_pending_tokens)
 
-        # Drag bindings (only for items tagged "token")
+        # Drag bindings (only for "token" items)
         self.Canvas1.tag_bind("token", "<ButtonPress-1>", self.drag_start)
         self.Canvas1.tag_bind("token", "<ButtonRelease-1>", self.drag_stop)
         self.Canvas1.tag_bind("token", "<B1-Motion>", self.drag)
@@ -218,18 +200,14 @@ class Toplevel1:
         self.Scrolledtreeview1.bind("<ButtonRelease-1>", self.tree_drag_stop)
         self.Scrolledtreeview1.bind("<B1-Motion>", self.tree_drag)
 
-        # Axis labels
-        self.draw_axes_labels()
-
-        # --- Settings load/restore (geometry + left panel width as ratio) ---
+        # Settings (window + left pane split)
         self._settings = self._load_settings()
         self._restore_geometry(self.top)
         self.top.after(0, self._restore_paned_sash)
 
-        # Save settings on close
         self.top.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # === Settings persistence ===
+    # ===== Settings =====
     def _load_settings(self):
         try:
             with open(SETTINGS_FILE, "r") as f:
@@ -245,7 +223,7 @@ class Toplevel1:
         try:
             total = max(self.paned.winfo_width(), 1)
             leftw = self.paned.sashpos(0)
-            ratio = max(0.15, min(0.7, leftw / total))  # clamp to reasonable range
+            ratio = max(0.15, min(0.7, leftw / total))
         except Exception:
             ratio = None
 
@@ -277,7 +255,7 @@ class Toplevel1:
         ratio = self._settings.get("left_panel_ratio", 0.30)
         ratio = max(0.15, min(0.7, float(ratio)))
         px = int(ratio * width)
-        px = max(120, min(width - 240, px))  # at least 120px left; leave ~240px for right
+        px = max(120, min(width - 240, px))
         try:
             self.paned.sashpos(0, px)
         except Exception:
@@ -302,9 +280,96 @@ class Toplevel1:
             except Exception:
                 pass
 
-    # ===== Initial token placement (deferred until canvas has real size) =====
-    def _maybe_place_pending_tokens(self, event=None):
-        # Guard against double calls from <Configure> + after(0)
+    # ===== Scroll region & axes =====
+    def _init_content_bounds(self):
+        if self._content_bounds is None:
+            w = max(1, self.Canvas1.winfo_width())
+            h = max(1, self.Canvas1.winfo_height())
+            self._content_bounds = [0, 0, w, h]
+            self.Canvas1.config(scrollregion=tuple(self._content_bounds))
+            self.draw_axes()
+
+    def _expand_content_bounds(self, bbox, margin=40):
+        if not bbox:
+            return
+        self._init_content_bounds()
+        x1, y1, x2, y2 = bbox
+        changed = False
+        if x2 + margin > self._content_bounds[2]:
+            self._content_bounds[2] = int(x2 + margin)
+            changed = True
+        if y2 + margin > self._content_bounds[3]:
+            self._content_bounds[3] = int(y2 + margin)
+            changed = True
+        if changed:
+            self.Canvas1.config(scrollregion=tuple(self._content_bounds))
+            self.draw_axes()
+
+    def _canvas_center(self):
+        self._init_content_bounds()
+        x0, y0, x1, y1 = self._content_bounds
+        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+
+    def draw_axes(self):
+        """Cartesian-like axes centered in the canvas (not the viewport) with absolute pixel labels."""
+        self.Canvas1.delete('axes')
+        self._init_content_bounds()
+        x0, y0, xmax, ymax = self._content_bounds
+        cx, cy = self._canvas_center()  # fixed relative to the canvas extent
+
+        # Main axes
+        self.Canvas1.create_line(x0, cy, xmax, cy, fill='#666666', width=1, tags=('axes',))
+        self.Canvas1.create_line(cx, y0, cx, ymax, fill='#666666', width=1, tags=('axes',))
+
+        # Tick spacing and label spacing (in pixels)
+        tick = 200
+        label_every = 400
+
+        # Helper: start on a multiple of 'tick'
+        def start_multiple(a, step):
+            if a % step == 0:
+                return int(a)
+            return int(a + (step - (a % step)))
+
+        # Horizontal axis ticks (absolute x labels)
+        x = start_multiple(int(x0), tick)
+        while x <= int(xmax):
+            self.Canvas1.create_line(x, cy - 5, x, cy + 5, fill='#777777', tags=('axes',))
+            if (x % label_every) == 0:
+                self.Canvas1.create_text(x, cy + 12, text=str(x), anchor='n', fill='#333333', tags=('axes',))
+            x += tick
+
+        # Vertical axis ticks (absolute y labels; note: canvas y grows downward)
+        y = start_multiple(int(y0), tick)
+        while y <= int(ymax):
+            self.Canvas1.create_line(cx - 5, y, cx + 5, y, fill='#777777', tags=('axes',))
+            if (y % label_every) == 0:
+                self.Canvas1.create_text(cx + 10, y, text=str(y), anchor='w', fill='#333333', tags=('axes',))
+            y += tick
+
+        # Axis titles
+        self.Canvas1.create_text(min(xmax - 80, cx + 100), cy - 12, text="x", anchor='w',
+                                 fill='#222222', tags=('axes',))
+        self.Canvas1.create_text(cx + 10, max(y0 + 10, cy - 100), text="y", anchor='w',
+                                 fill='#222222', tags=('axes',))
+
+    def _on_canvas_resize(self, event):
+        # Ensure content bounds at least as large as visible area
+        self._init_content_bounds()
+        changed = False
+        if event.width > self._content_bounds[2]:
+            self._content_bounds[2] = int(event.width)
+            changed = True
+        if event.height > self._content_bounds[3]:
+            self._content_bounds[3] = int(event.height)
+            changed = True
+        if changed:
+            self.Canvas1.config(scrollregion=tuple(self._content_bounds))
+        # Recenter axes to the canvas center (not viewport)
+        self.draw_axes()
+
+    # ===== Initial token placement =====
+    def _maybe_place_pending_tokens(self):
         if self._initial_tokens_placed or self._placing_tokens:
             return
         w = self.Canvas1.winfo_width()
@@ -319,31 +384,22 @@ class Toplevel1:
         self._initial_tokens_placed = True
         self._placing_tokens = False
 
-    # ===== Axis labels =====
-    def draw_axes_labels(self):
-        self.Canvas1.delete('axis_label')
-        w = self.Canvas1.winfo_width()
-        h = self.Canvas1.winfo_height()
-        self.Canvas1.create_text(w/2, h-12, text="Urgency →", tags=('axis_label',), anchor='s')
-        self.Canvas1.create_text(10, 12, text="Importance ↑", tags=('axis_label',), anchor='nw')
-
-    def _on_canvas_resize(self, event):
-        self.draw_axes_labels()
-
-    # ===== Tokens on canvas (auto-sized, wrapped text, rounded-ish rect) =====
+    # ===== Tokens (pill + compact inline controls) =====
     def create_token(self, x, y, color, task):
         title = task.get('title', '')
-        # main pill text (measure)
         max_text_width = min(220, max(140, int(self.Canvas1.winfo_width() * 0.25)))
         temp_text_id = self.Canvas1.create_text(
             x, y, text=title, width=max_text_width, anchor="center", tags=("token_temp_text",)
         )
         self.Canvas1.update_idletasks()
-        bbox = self.Canvas1.bbox(temp_text_id)  # (x1,y1,x2,y2)
+        bbox = self.Canvas1.bbox(temp_text_id)
         if not bbox:
             bbox = (x-40, y-15, x+40, y+15)
         pad_x, pad_y = 12, 8
-        rx1, ry1, rx2, ry2 = bbox[0]-pad_x, bbox[1]-pad_y, bbox[2]+pad_x, bbox[3]+pad_y
+
+        extra_h = 24  # compact controls strip inside pill
+        rx1, ry1, rx2, ry2 = bbox[0]-pad_x, bbox[1]-pad_y, bbox[2]+pad_x, bbox[3]+pad_y + extra_h
+
         # Rounded-ish rectangle via smoothed polygon
         points = [
             rx1+10, ry1,  rx2-10, ry1,  rx2, ry1,  rx2, ry1+10,
@@ -355,7 +411,8 @@ class Toplevel1:
         )
         self.Canvas1.delete(temp_text_id)
         text_id = self.Canvas1.create_text(
-            (rx1+rx2)//2, (ry1+ry2)//2, text=title, width=max_text_width,
+            (rx1+rx2)//2, (ry1+ry2 - extra_h)//2,
+            text=title, width=max_text_width,
             anchor="center", fill="white", tags=("token",)
         )
 
@@ -367,7 +424,10 @@ class Toplevel1:
         # Subtask panel state: collapsed by default
         self._subtask_panels[rect_id] = {"expanded": False, "ids": None, "icon": None}
 
-        # If this task has subtasks, draw a + icon (BOTTOM-RIGHT) and bind click
+        # Compact controls INSIDE the pill
+        self._create_compact_controls_inside_pill(rect_id, rx1, ry1, rx2, ry2, extra_h, color, task, group_tag)
+
+        # If this task has subtasks, draw a + icon (BOTTOM-RIGHT)
         parent_id = task.get('id')
         if parent_id:
             titles = self._gather_subtasks_titles(parent_id)
@@ -375,49 +435,100 @@ class Toplevel1:
                 icon_ids = self._render_toggle_icon_bottom_right(rect_id, rx1, ry1, rx2, ry2, expanded=False)
                 self._subtask_panels[rect_id]["icon"] = icon_ids
 
-        # Register this token id with backend (single id is enough)
+        # Register this token id with backend
         try:
             self.gt.setTokenId(rect_id, task)
         except Exception:
             pass
-
-        # Keep a quick lookup to its task id for toggling
         self.Canvas1.itemconfig(rect_id, tags=self.Canvas1.gettags(rect_id) + (f"taskid_{task.get('id','')}",))
 
+        # Expand scrollregion to include the whole token group
+        gbb = self.Canvas1.bbox(group_tag)
+        self._expand_content_bounds(gbb, margin=60)
         return rect_id
 
+    def _create_compact_controls_inside_pill(self, rect_id, rx1, ry1, rx2, ry2, extra_h, pill_color, task, group_tag):
+        row_y = ry2 - (extra_h // 2)
+        row_w = max(80, (rx2 - rx1) - 24)
+
+        frame = tk.Frame(self.Canvas1, bg=pill_color, bd=0, highlightthickness=0)
+
+        var_est = tk.StringVar()
+        if task.get('time_estimate') is not None:
+            var_est.set(f"{float(task['time_estimate']):g}")
+        entry = tk.Entry(
+            frame, width=3, textvariable=var_est,
+            bd=0, highlightthickness=0, relief="flat", justify="right"
+        )
+        lbl_h = tk.Label(frame, text="h", bg=pill_color, fg="white")
+
+        var_prog = tk.IntVar(value=int(task.get('progress', 0)))
+        scale = ttk.Scale(frame, from_=0, to=100, orient=tk.HORIZONTAL, length=max(60, row_w - 50), variable=var_prog)
+
+        entry.pack(side="left", padx=(6,2), pady=0)
+        lbl_h.pack(side="left", padx=(0,6), pady=0)
+        scale.pack(side="left", padx=(0,6), pady=0)
+
+        cx = (rx1 + rx2) // 2
+        win_id = self.Canvas1.create_window(cx, row_y, window=frame, anchor="center")
+        self.Canvas1.addtag_withtag(group_tag, win_id)
+
+        def persist_estimate(event=None, token_rect_id=rect_id, entry_widget=entry):
+            task_obj = self.gt.getTaskByTokenId(token_rect_id)
+            if not task_obj:
+                return
+            val = entry_widget.get().strip()
+            if val == "":
+                # leave absent
+                return
+            try:
+                hours = max(0.0, float(val))
+                self.gt.updateTask(task_obj, t_hours=hours, resort=False)
+            except Exception:
+                if task_obj.get('time_estimate') is not None:
+                    entry_widget.delete(0, tk.END)
+                    entry_widget.insert(0, f"{float(task_obj['time_estimate']):g}")
+
+        def persist_progress(event=None, token_rect_id=rect_id, var=var_prog):
+            task_obj = self.gt.getTaskByTokenId(token_rect_id)
+            if not task_obj:
+                return
+            try:
+                p = max(0, min(100, int(float(var.get()))))
+                self.gt.updateTask(task_obj, progress=p, resort=False)
+            except Exception:
+                pass
+
+        entry.bind("<FocusOut>", persist_estimate)
+        entry.bind("<Return>", persist_estimate)
+        scale.bind("<ButtonRelease-1>", persist_progress)
+
+        self._token_widgets[rect_id] = {
+            "frame": frame, "window_id": win_id,
+            "entry": entry, "scale": scale, "vars": (var_est, var_prog)
+        }
+
     def _render_toggle_icon_bottom_right(self, rect_id, rx1, ry1, rx2, ry2, expanded: bool):
-        """
-        Render a small circular + / - icon at the pill's BOTTOM-RIGHT corner.
-        Returns (icon_bg_id, icon_text_id) and binds click to toggle panel.
-        IMPORTANT: No "token" tag on icon to avoid drag bindings.
-        """
         group_tag = f"token_group_{rect_id}"
-        size = 16  # diameter
+        size = 16
         margin = 6
         cx = rx2 - margin - size // 2
         cy = ry2 - margin - size // 2
 
         icon_bg_id = self.Canvas1.create_oval(
             cx - size//2, cy - size//2, cx + size//2, cy + size//2,
-            fill="#f7f7f7", outline="#b7b7b7",  # NOTE: no "token" tag
+            fill="#f7f7f7", outline="#b7b7b7",
         )
         icon_text_id = self.Canvas1.create_text(
             cx, cy, text=("-" if expanded else "+"), fill="black",
-            font=("TkDefaultFont", 10, "bold"),  # NOTE: no "token" tag
+            font=("TkDefaultFont", 10, "bold"),
         )
-
-        # bind both bg and text to same handler
         toggle_tag = f"subtoggle_{rect_id}"
         self.Canvas1.addtag_withtag(toggle_tag, icon_bg_id)
         self.Canvas1.addtag_withtag(toggle_tag, icon_text_id)
-        # make them move with the pill (group tag), but still not draggable themselves
         self.Canvas1.addtag_withtag(group_tag, icon_bg_id)
         self.Canvas1.addtag_withtag(group_tag, icon_text_id)
-
-        # Clicking the icon should ONLY toggle; avoid drag handlers by not using "token" tag
         self.Canvas1.tag_bind(toggle_tag, "<Button-1>", lambda e, rid=rect_id: self.toggle_subtasks_panel(rid))
-
         return (icon_bg_id, icon_text_id)
 
     def _set_toggle_icon(self, rect_id, expanded: bool):
@@ -431,18 +542,15 @@ class Toplevel1:
             pass
 
     def _taskid_for_rect(self, rect_id):
-        # extract Google Task id from polygon tags
         for t in self.Canvas1.gettags(rect_id):
             if t.startswith("taskid_"):
                 return t[len("taskid_"):] or None
         return None
 
     def _gather_subtasks_titles(self, parent_id):
-        """Return cached subtasks for parent_id; if missing, compute once from self.myTasks and cache."""
         titles = self._subtasks_by_parent.get(parent_id)
         if titles is not None:
             return titles
-
         titles = []
         for _list_title, tasks_map in self.myTasks.items():
             for _pos_key, t in tasks_map.items():
@@ -454,13 +562,10 @@ class Toplevel1:
         return titles
 
     def toggle_subtasks_panel(self, rect_id):
-        """Expand/collapse the inline subtask rectangle under the pill."""
         state = self._subtask_panels.get(rect_id)
         if not state:
             return
-
         if state["expanded"]:
-            # collapse: remove items
             ids = state["ids"]
             if ids:
                 for cid in ids:
@@ -473,14 +578,12 @@ class Toplevel1:
             self._set_toggle_icon(rect_id, expanded=False)
             return
 
-        # expand: compute titles and render panel
         parent_id = self._taskid_for_rect(rect_id)
         if not parent_id:
             return
         titles = self._gather_subtasks_titles(parent_id)
         if not titles:
             return
-
         pill_bbox = self.Canvas1.bbox(rect_id)
         if not pill_bbox:
             return
@@ -491,21 +594,15 @@ class Toplevel1:
         state["expanded"] = True
         self._set_toggle_icon(rect_id, expanded=True)
 
-    def _render_subtasks_panel(self, rect_id, rx1, ry1, rx2, ry2, titles):
-        """
-        Create a rounded rectangle panel with bullet list of titles, under the main pill.
-        - Panel width sized to fit text WITHOUT wrapping.
-        - Slightly shifted a bit to the right.
-        - Text is black.
-        - Attached to the same group as the pill.
-        Returns: (panel_rect_id, panel_text_id)
-        """
-        group_tag = f"token_group_{rect_id}"
+        # Expand scrollregion to include the panel
+        if ids and len(ids) >= 1:
+            pb = self.Canvas1.bbox(ids[0])  # panel rect bbox
+            self._expand_content_bounds(pb, margin=40)
 
-        # Build the text (no width => no wrapping)
+    def _render_subtasks_panel(self, rect_id, rx1, ry1, rx2, ry2, titles):
+        group_tag = f"token_group_{rect_id}"
         text = "• " + "\n• ".join(titles)
 
-        # Measure natural size (no wrapping) using a temporary text item
         shift_right = 8
         pad_x = 10
         pad_y = 8
@@ -514,11 +611,11 @@ class Toplevel1:
 
         temp = self.Canvas1.create_text(
             pill_cx, ry2 + gap + pad_y,
-            text=text, anchor="n", justify="left",  # NO width -> no wrapping
+            text=text, anchor="n", justify="left",
             fill="black", tags=("token_temp_text",)
         )
         self.Canvas1.update_idletasks()
-        tb = self.Canvas1.bbox(temp)  # (x1,y1,x2,y2) of text alone
+        tb = self.Canvas1.bbox(temp)
         if not tb:
             tb = (pill_cx - 50, ry2 + gap + pad_y, pill_cx + 50, ry2 + gap + pad_y + 20)
         text_w = tb[2] - tb[0]
@@ -529,7 +626,6 @@ class Toplevel1:
         panel_y1 = ry2 + gap
         panel_y2 = panel_y1 + pad_y + text_h + pad_y
 
-        # Rounded-ish rectangle panel
         r = 8
         pts = [
             panel_x1+r, panel_y1, panel_x2-r, panel_y1, panel_x2, panel_y1, panel_x2, panel_y1+r,
@@ -538,17 +634,15 @@ class Toplevel1:
         ]
         panel_rect_id = self.Canvas1.create_polygon(
             pts, smooth=True, splinesteps=12, outline="#b7b7b7", fill="#f7f7f7",
-            tags=("token",)  # keep draggable with the pill
+            tags=("token",)
         )
-        # Recreate text as the final (non-temp) item at same spot (no width)
         self.Canvas1.delete(temp)
         panel_text_id = self.Canvas1.create_text(
             pill_cx, panel_y1 + pad_y,
             text=text, anchor="n", justify="left",
-            fill="black", tags=("token",)  # keep draggable with the pill
+            fill="black", tags=("token",)
         )
 
-        # bind to same group so everything moves as a unit
         self.Canvas1.addtag_withtag(group_tag, panel_rect_id)
         self.Canvas1.addtag_withtag(group_tag, panel_text_id)
 
@@ -579,22 +673,33 @@ class Toplevel1:
         self.Scrolledtreeview1.configure(cursor="hand")
         self.Canvas1.configure(cursor="hand")
 
+    def _persist_group_center(self):
+        """Persist using the group's visual center; correct even when scrolled."""
+        if not self._drag_data["group"]:
+            return None
+        gbb = self.Canvas1.bbox(self._drag_data["group"])
+        if not gbb:
+            return None
+        cx = (gbb[0] + gbb[2]) // 2
+        cy = (gbb[1] + gbb[3]) // 2
+        return (cx, cy)
+
     def drag_stop(self, event):
-        # Only persist if the item actually moved
         if self._drag_data["rect_id"] is not None and self._drag_data.get("moved"):
             task = self.gt.getTaskByTokenId(self._drag_data["rect_id"])
             if task:
-                self.gt.updateTaskCoodinates(task, event.x, event.y)
+                center = self._persist_group_center()
+                if center:
+                    self.gt.updateTaskCoodinates(task, center[0], center[1])
+            # expand scrollregion to include final position
+            gbb = self.Canvas1.bbox(self._drag_data["group"])
+            self._expand_content_bounds(gbb, margin=60)
         self._drag_data = {"x": 0, "y": 0, "group": None, "rect_id": None, "moved": False}
         self.Scrolledtreeview1.configure(cursor="arrow")
         self.Canvas1.configure(cursor="arrow")
 
     def drag(self, event):
         if not self._drag_data["group"]:
-            return
-        # keep token inside canvas while dragging
-        if event.x > self.Canvas1.winfo_width() or event.x < 0 or \
-           event.y > self.Canvas1.winfo_height() or event.y < 0:
             return
         delta_x = event.x - self._drag_data["x"]
         delta_y = event.y - self._drag_data["y"]
@@ -611,18 +716,20 @@ class Toplevel1:
         self.Canvas1.configure(cursor="hand")
 
     def tree_drag_stop(self, event):
-        tree_width = self.Scrolledtreeview1.winfo_width()
         if self._drag_data['rect_id'] is not None:
             task = self.gt.getTaskByTokenId(self._drag_data['rect_id'])
             if task:
-                self.gt.updateTaskCoodinates(task, event.x - tree_width, event.y)
+                center = self._persist_group_center()
+                if center:
+                    self.gt.updateTaskCoodinates(task, center[0], center[1])
+            gbb = self.Canvas1.bbox(self._drag_data["group"])
+            self._expand_content_bounds(gbb, margin=60)
         self._drag_data = {"x": 0, "y": 0, "group": None, "rect_id": None, "moved": False}
         self.Scrolledtreeview1.configure(cursor="arrow")
         self.Canvas1.configure(cursor="arrow")
 
     def tree_drag(self, event):
         tree_width = self.Scrolledtreeview1.winfo_width()
-        # Crossed into the canvas? Create token (once) and remove from tree
         if event.x > tree_width and not self._drag_data["group"]:
             focused = self.Scrolledtreeview1.focus()
             if focused:
@@ -631,20 +738,14 @@ class Toplevel1:
                 if len(tags) >= 2 and tags[1] == 'task':
                     task = self.list_to_task.get(int(focused))
                     if task:
-                        # Collect this task's subtasks from the tree and remove them (cache them)
                         self._collect_and_remove_subtasks_for(task_id=task.get('id'))
-                        # Create token near left edge of canvas
                         rect_id = self.create_token(4, event.y, tags[0], task)
                         group = f"token_group_{rect_id}"
                         self._drag_data["group"] = group
                         self._drag_data["rect_id"] = rect_id
                         self.Scrolledtreeview1.delete(self.Scrolledtreeview1.selection()[0])
 
-        # Move token while inside canvas bounds
-        if self._drag_data["group"] and \
-           event.x > tree_width and \
-           event.x < self.Canvas1.winfo_width() + tree_width and \
-           event.y < self.Canvas1.winfo_height() and event.y > 0:
+        if self._drag_data["group"] and event.x > tree_width:
             delta_x = event.x - self._drag_data["x"]
             delta_y = event.y - self._drag_data["y"]
             self.Canvas1.move(self._drag_data["group"], delta_x, delta_y)
@@ -653,10 +754,6 @@ class Toplevel1:
         self._drag_data["y"] = event.y
 
     def _collect_and_remove_subtasks_for(self, task_id):
-        """
-        When a parent task is moved to canvas from the tree, gather its subtasks,
-        remove them from the left pane, and store for inline panel.
-        """
         if not task_id:
             return
         titles = []
@@ -723,8 +820,6 @@ class AutoScroll(object):
 def _create_container(func):
     def wrapped(cls, master, **kw):
         container = ttk.Frame(master)
-        container.bind('<Enter>', lambda e: _bound_to_mousewheel(e, container))
-        container.bind('<Leave>', lambda e: _unbound_to_mousewheel(e, container))
         return func(cls, container, **kw)
     return wrapped
 
@@ -733,50 +828,6 @@ class ScrolledTreeView(AutoScroll, ttk.Treeview):
     def __init__(self, master, **kw):
         ttk.Treeview.__init__(self, master, **kw)
         AutoScroll.__init__(self, master)
-
-import platform
-def _bound_to_mousewheel(event, widget):
-    child = widget.winfo_children()[0]
-    if platform.system() in ('Windows', 'Darwin'):
-        child.bind_all('<MouseWheel>', lambda e: _on_mousewheel(e, child))
-        child.bind_all('<Shift-MouseWheel>', lambda e: _on_shiftmouse(e, child))
-    else:
-        child.bind_all('<Button-4>', lambda e: _on_mousewheel(e, child))
-        child.bind_all('<Button-5>', lambda e: _on_mousewheel(e, child))
-        child.bind_all('<Shift-Button-4>', lambda e: _on_shiftmouse(e, child))
-        child.bind_all('<Shift-Button-5>', lambda e: _on_shiftmouse(e, child))
-
-def _unbound_to_mousewheel(event, widget):
-    if platform.system() in ('Windows', 'Darwin'):
-        widget.unbind_all('<MouseWheel>')
-        widget.unbind_all('<Shift-MouseWheel>')
-    else:
-        widget.unbind_all('<Button-4>')
-        widget.unbind_all('<Button-5>')
-        widget.unbind_all('<Shift-Button-4>')
-        widget.unbind_all('<Shift-Button-5>')
-
-def _on_mousewheel(event, widget):
-    if platform.system() == 'Windows':
-        widget.yview_scroll(-1 * int(event.delta / 120), 'units')
-    elif platform.system() == 'Darwin':
-        widget.yview_scroll(-1 * int(event.delta), 'units')
-    else:
-        if event.num == 4:
-            widget.yview_scroll(-1, 'units')
-        elif event.num == 5:
-            widget.yview_scroll(1, 'units')
-
-def _on_shiftmouse(event, widget):
-    if platform.system() == 'Windows':
-        widget.xview_scroll(-1 * int(event.delta / 120), 'units')
-    elif platform.system() == 'Darwin':
-        widget.xview_scroll(-1 * int(event.delta), 'units')
-    else:
-        if event.num == 4:
-            widget.xview_scroll(-1, 'units')
-        elif event.num == 5:
-            widget.xview_scroll(1, 'units')
 
 if __name__ == '__main__':
     vp_start_gui()

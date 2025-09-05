@@ -18,6 +18,104 @@ logger.setLevel(logging.DEBUG)
 
 SEPARATOR_TITLE = "----- above ^^^ prioritized -----"
 
+# Single compact token, e.g. [x=788,y=191,est=0.5,progress=69]
+RE_BLOCK = re.compile(r'\[([^\]]*)\]')
+
+def _parse_notes_map(notes: str):
+    """
+    Parse the first [key=value,...] block into a dict.
+    Returns ({k:v as strings}, start_idx, end_idx). If not found, returns ({}, -1, -1).
+    """
+    if not notes:
+        return {}, -1, -1
+    m = RE_BLOCK.search(notes)
+    if not m:
+        return {}, -1, -1
+    body = m.group(1)
+    kvs = {}
+    for part in body.split(','):
+        part = part.strip()
+        if not part or '=' not in part:
+            continue
+        k, v = part.split('=', 1)
+        kvs[k.strip()] = v.strip()
+    return kvs, m.start(), m.end()
+
+def _to_notes_block(kvs: dict):
+    # keep order x,y,est,progress if present
+    order = ['x', 'y', 'est', 'progress']
+    parts = []
+    for k in order:
+        if k in kvs:
+            parts.append(f"{k}={kvs[k]}")
+    # include any other keys that may be present
+    for k in kvs:
+        if k not in order:
+            parts.append(f"{k}={kvs[k]}")
+    return "[" + ",".join(parts) + "]"
+
+def _read_xy_est_progress(notes: str):
+    """
+    Return ((x,y) or None, est or None, progress or None) parsed from first bracket block.
+    """
+    kvs, _, _ = _parse_notes_map(notes or "")
+    x = kvs.get('x'); y = kvs.get('y')
+    est = kvs.get('est'); prog = kvs.get('progress')
+    coords = None
+    if x is not None and y is not None:
+        try:
+            coords = (int(float(x)), int(float(y)))
+        except Exception:
+            coords = None
+    est_val = None
+    if est is not None:
+        try:
+            est_val = float(est)
+        except Exception:
+            est_val = None
+    prog_val = None
+    if prog is not None:
+        try:
+            prog_i = int(float(prog))
+            prog_val = max(0, min(100, prog_i))
+        except Exception:
+            prog_val = None
+    return coords, est_val, prog_val
+
+def _write_xy_est_progress(notes: str, x=None, y=None, est=None, progress=None):
+    """
+    Insert or update the single bracket block with any provided values.
+    Unspecified fields remain as-is if present.
+    """
+    kvs, s, e = _parse_notes_map(notes or "")
+    if s == -1:
+        kvs = {}
+        prefix = (notes or "")
+        if prefix and not prefix.endswith("\n"):
+            prefix = prefix + "\n\n"
+    else:
+        prefix = (notes or "")[:s]
+        suffix = (notes or "")[e:]
+        # we’ll rebuild block and keep prefix+suffix
+        if prefix and not prefix.endswith("\n"):
+            prefix = prefix + "\n\n"
+        # (no need to include suffix; we’ll append it back below)
+
+    if x is not None:
+        kvs['x'] = str(int(x))
+    if y is not None:
+        kvs['y'] = str(int(y))
+    if est is not None:
+        kvs['est'] = f"{float(est):g}"
+    if progress is not None:
+        kvs['progress'] = str(int(progress))
+
+    block = _to_notes_block(kvs)
+    if s == -1:
+        return (prefix + block).strip()
+    else:
+        return (prefix + block + suffix).strip()
+
 class GoogleTasks:
 
     def __init__(self):
@@ -27,7 +125,6 @@ class GoogleTasks:
         here = os.path.dirname(os.path.abspath(__file__))
         creds_path = os.path.join(here, 'credentials.json')
         token_path  = os.path.join(here, 'token.json')
-
 
         if os.path.exists(token_path):
             try:
@@ -71,7 +168,6 @@ class GoogleTasks:
         self.separators = {}
         self.user_tasks = {}
 
-
     def getTasks(self, taskList=None):
         """
         Active tasks only, lexicographic 'position' order.
@@ -107,19 +203,13 @@ class GoogleTasks:
                         self.separators[task_list['id']] = task
                         continue
 
-                    # parse coordinates (store as ints)
-                    task_notes = task.get('notes')
-                    if task_notes:
-                        coords = re.findall(
-                            r'.*\[x=([0-9]+),y=([0-9]+)\].*',
-                            task_notes,
-                            re.MULTILINE | re.DOTALL
-                        )
-                        if coords:
-                            try:
-                                task['coordinates'] = (int(coords[0][0]), int(coords[0][1]))
-                            except Exception:
-                                pass
+                    coords, est, prog = _read_xy_est_progress(task.get('notes') or "")
+                    if coords:
+                        task['coordinates'] = coords
+                    if est is not None:
+                        task['time_estimate'] = est
+                    if prog is not None:
+                        task['progress'] = prog
 
                     pos_key = task.get('position', '')
                     while pos_key in self.user_tasks[task_list['title']]:
@@ -132,17 +222,10 @@ class GoogleTasks:
 
         return self.user_tasks
 
-
     def setTokenId(self, token_id, task):
         self.token_list[token_id] = task
 
-
     def getTaskByTokenId(self, token_id: int):
-        """
-        Be tolerant to different canvas item ids:
-        - Return by exact key if present.
-        - Otherwise try neighbors (old odd/even pairing logic).
-        """
         t = self.token_list.get(token_id)
         if t:
             return t
@@ -151,12 +234,12 @@ class GoogleTasks:
             return t
         return self.token_list.get(token_id + 1)
 
-
     def weightBasedOnCoordinates(self, e):
-        importance = 5000 - int(e['coordinates'][1])
-        urgency = int(e['coordinates'][0])
+        y = e.get('coordinates', (0, 5000))[1]
+        x = e.get('coordinates', (0, 0))[0]
+        importance = 5000 - int(y)
+        urgency = int(x)
         return importance * 10 + urgency
-
 
     def moveTaskToTheTop(self, task):
         return self.service.tasks().move(
@@ -166,13 +249,10 @@ class GoogleTasks:
     def insertNewTaskAtTheTop(self, list_id, task):
         return self.service.tasks().insert(tasklist=list_id, body=task).execute()
 
-
     def sortPrioritizedTasks(self, list_id):
-        # Deduplicate tasks by their Google Tasks id first, then sort
         unique_by_id = {}
         for t in self.token_list.values():
-            # Only keep tasks for this list
-            if t.get('task_list_id') == list_id:
+            if t.get('task_list_id') == list_id and t.get('coordinates'):
                 unique_by_id[t['id']] = t
 
         prioritized_tasks = sorted(unique_by_id.values(), key=self.weightBasedOnCoordinates)
@@ -186,48 +266,63 @@ class GoogleTasks:
                 'title': SEPARATOR_TITLE,
                 'status': 'needsAction',
             }
-            return_value = self.insertNewTaskAtTheTop(list_id, new_task)
-            return_value['task_list_id'] = list_id
-            self.separators[list_id] = return_value
+            rv = self.insertNewTaskAtTheTop(list_id, new_task)
+            rv['task_list_id'] = list_id
+            self.separators[list_id] = rv
 
         for task in prioritized_tasks:
             print(f"Moving '{task['title']}' to the top")
             self.moveTaskToTheTop(task)
 
-
-    def updateTaskCoodinates(self, task, x, y):
-        if x < 0: x = 0
-        if y < 0: y = 0
-        print(f"Updating list {task['task_list_id']}, task {task['id']} with x={x}, y={y}")
-        task['coordinates'] = (int(x), int(y))
-        notes = task.get('notes')
-        new_coords = f"[x={int(x)},y={int(y)}]"
-        if notes:
-            coords = re.findall(
-                r'.*\[x=([0-9]+),y=([0-9]+)\].*',
-                task['notes'],
-                re.MULTILINE | re.DOTALL
-            )
-            if coords:
-                current_coords = f"[x={coords[0][0]},y={coords[0][1]}]"
-                new_notes = notes.replace(current_coords, new_coords)
-            else:
-                new_notes = f"{notes}\n\n{new_coords}"
-        else:
-            new_notes = f"\n\n{new_coords}"
-        task['notes'] = new_notes
-
-        # persist to API
+    def _persist(self, task):
         self.service.tasks().update(
             tasklist=task['task_list_id'], task=task['id'], body=task
         ).execute()
 
-        # resort within list
-        self.sortPrioritizedTasks(task['task_list_id'])
+    # NEW: unified updater used by the UI
+    def updateTask(self, task, x=None, y=None, t_hours=None, progress=None, resort=True):
+        """
+        Update any subset of (x,y,time_estimate,progress) and persist to API.
+        Stores as a SINGLE bracket: [x=..,y=..,est=..,progress=..]
+        """
+        notes = task.get('notes') or ""
+        coords = task.get('coordinates', (None, None))
+        cur_x, cur_y = coords
 
+        if x is not None:
+            cur_x = max(0, int(x))
+        if y is not None:
+            cur_y = max(0, int(y))
+        if cur_x is not None and cur_y is not None:
+            task['coordinates'] = (cur_x, cur_y)
 
-if __name__ == '__main__':
-    gt = GoogleTasks()
-    tasks = gt.getTasks()
-    for k in tasks.keys():
-        print(f"{k} has {len(tasks[k])} tasks (active only)")
+        if t_hours is not None:
+            try:
+                task['time_estimate'] = float(t_hours)
+            except Exception:
+                pass
+
+        if progress is not None:
+            try:
+                task['progress'] = max(0, min(100, int(progress)))
+            except Exception:
+                pass
+
+        notes = _write_xy_est_progress(
+            notes,
+            x=cur_x if cur_x is not None else None,
+            y=cur_y if cur_y is not None else None,
+            est=task.get('time_estimate', None) if t_hours is not None else None,
+            progress=task.get('progress', None) if progress is not None else None
+        )
+        task['notes'] = notes
+
+        self._persist(task)
+
+        if resort and (x is not None or y is not None):
+            self.sortPrioritizedTasks(task['task_list_id'])
+
+    # Back-compat alias for coords-only updates
+    def updateTaskCoodinates(self, task, x, y):
+        print(f"Updating list {task['task_list_id']}, task {task['id']} with x={x}, y={y}")
+        self.updateTask(task, x=x, y=y, resort=True)
