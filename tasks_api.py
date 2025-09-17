@@ -334,14 +334,10 @@ class GoogleTasks:
 
 
 if __name__ == "__main__":
-    import sys
-    from datetime import datetime
-
     gt = GoogleTasks()
     svc = gt.service
 
     def iter_tasklists():
-        """Yield all task lists (handles pagination)."""
         token = None
         while True:
             resp = svc.tasklists().list(maxResults=100, pageToken=token).execute()
@@ -351,69 +347,110 @@ if __name__ == "__main__":
             if not token:
                 break
 
-    def iter_tasks(list_id):
-        """Yield all tasks in a list (handles pagination). Includes completed & hidden."""
+    def fetch_active_tasks(list_id):
+        """Return all active (not completed/hidden/deleted) tasks for the list."""
+        tasks = []
         token = None
         while True:
             resp = svc.tasks().list(
                 tasklist=list_id,
                 maxResults=100,
                 pageToken=token,
-                showCompleted=True, #
-                showHidden=True, #
+                showCompleted=False,
+                showHidden=False,
                 showDeleted=False,
             ).execute()
-            for t in resp.get("items", []):
-                yield t
+            tasks.extend(resp.get("items", []))
             token = resp.get("nextPageToken")
             if not token:
                 break
+        return tasks
+
+    def build_tree(tasks):
+        """
+        Build a tree of tasks keyed by id with children arrays.
+        Returns (roots_in_order, by_id).
+        Siblings are ordered by 'position' (lexicographic).
+        """
+        by_id = {}
+        for t in tasks:
+            t.setdefault("_children", [])
+            by_id[t["id"]] = t
+
+        # attach children to parents
+        roots = []
+        for t in tasks:
+            parent_id = t.get("parent")
+            if parent_id and parent_id in by_id:
+                by_id[parent_id]["_children"].append(t)
+            else:
+                roots.append(t)
+
+        # sort siblings by position (respecting API ordering semantics)
+        def sort_children(node):
+            node["_children"].sort(key=lambda x: x.get("position", ""))
+            for c in node["_children"]:
+                sort_children(c)
+
+        roots.sort(key=lambda x: x.get("position", ""))
+        for r in roots:
+            sort_children(r)
+
+        return roots, by_id
+
+    def print_task(t, indent=0):
+        pad = "  " * indent
+        title = t.get("title", "<no title>")
+        notes = (t.get("notes") or "").strip()
+        due = t.get("due")  # RFC3339 timestamp if present
+
+        coords, est, prog = _read_xy_est_progress(notes)
+
+        # Header line
+        line = f"\n{pad}- {title}"
+        if due:
+            line += f"  (due: {due})"
+        print(line)
+
+        # Parsed fields (only show if present)
+        extras = []
+        if coords:
+            extras.append(f"xy={coords[0]},{coords[1]}")
+        if est is not None:
+            extras.append(f"est={est}h")
+        if prog is not None:
+            extras.append(f"progress={prog}%")
+        if extras:
+            print(f"{pad}  " + " | ".join(extras))
+
+        # Raw notes (after parsed fields)
+        if notes:
+            print(f"{pad}  notes:")
+            for line in notes.splitlines():
+                print(f"{pad}    {line}")
+
+        # Any links
+        for link in (t.get("links") or []):
+            desc = link.get("description") or ""
+            href = link.get("link") or ""
+            typ  = link.get("type") or ""
+            print(f"{pad}  link: {desc} [{typ}] -> {href}")
+
+        # Recurse into children
+        for c in t.get("_children", []):
+            print_task(c, indent + 1)
 
     total = 0
     for tl in iter_tasklists():
         list_title = tl.get("title", "<untitled>")
         list_id = tl.get("id")
-        print(f"\n=== Task list: {list_title} ({list_id}) ===")
+        print(f"\n=== {list_title} ===")
 
-        for t in iter_tasks(list_id):
-            total += 1
-            title = t.get("title", "<no title>")
-            notes = (t.get("notes") or "").strip()
+        tasks = fetch_active_tasks(list_id)
+        roots, _ = build_tree(tasks)
 
-            # Parse your compact notes block to expose coordinates/est/progress if present
-            coords, est, prog = _read_xy_est_progress(notes)
+        for r in roots:
+            print_task(r)
+            total += 1  # count only root items in the top-level total
 
-            print(f"- {title}")
-            # Core metadata
-            for k in ("status", "due", "completed", "updated", "position", "parent"):
-                v = t.get(k)
-                if v:
-                    print(f"    {k}: {v}")
-
-            # Parsed fields from the notes block
-            if coords:
-                print(f"    coordinates: x={coords[0]}, y={coords[1]}")
-            if est is not None:
-                print(f"    time_estimate(h): {est}")
-            if prog is not None:
-                print(f"    progress(%): {prog}")
-
-            # Raw notes (kept last for readability)
-            if notes:
-                print("    notes:")
-                # indent multi-line notes nicely
-                for line in notes.splitlines():
-                    print(f"        {line}")
-
-            # Any attached links
-            links = t.get("links") or []
-            for link in links:
-                desc = link.get("description") or ""
-                href = link.get("link") or ""
-                typ  = link.get("type") or ""
-                print(f"    link: {desc} [{typ}] -> {href}")
-
-            # Show the task's id last (handy for scripting)
-            print(f"    id: {t.get('id')}")
-
-    print(f"\nTotal tasks listed: {total}")
+    print("\n(Done)")
