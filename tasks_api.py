@@ -326,3 +326,94 @@ class GoogleTasks:
     def updateTaskCoodinates(self, task, x, y):
         print(f"Updating list {task['task_list_id']}, task {task['id']} with x={x}, y={y}")
         self.updateTask(task, x=x, y=y, resort=True)
+
+# ========
+# block that walks all your task lists and prints every task (including completed & hidden) with useful details
+# This includes completed and hidden tasks (showCompleted=True, showHidden=True).
+# If you want only active tasks, set those to False.
+
+
+if __name__ == "__main__":
+    import sys
+    from datetime import datetime
+
+    gt = GoogleTasks()
+    svc = gt.service
+
+    def iter_tasklists():
+        """Yield all task lists (handles pagination)."""
+        token = None
+        while True:
+            resp = svc.tasklists().list(maxResults=100, pageToken=token).execute()
+            for tl in resp.get("items", []):
+                yield tl
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+
+    def iter_tasks(list_id):
+        """Yield all tasks in a list (handles pagination). Includes completed & hidden."""
+        token = None
+        while True:
+            resp = svc.tasks().list(
+                tasklist=list_id,
+                maxResults=100,
+                pageToken=token,
+                showCompleted=True, #
+                showHidden=True, #
+                showDeleted=False,
+            ).execute()
+            for t in resp.get("items", []):
+                yield t
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+
+    total = 0
+    for tl in iter_tasklists():
+        list_title = tl.get("title", "<untitled>")
+        list_id = tl.get("id")
+        print(f"\n=== Task list: {list_title} ({list_id}) ===")
+
+        for t in iter_tasks(list_id):
+            total += 1
+            title = t.get("title", "<no title>")
+            notes = (t.get("notes") or "").strip()
+
+            # Parse your compact notes block to expose coordinates/est/progress if present
+            coords, est, prog = _read_xy_est_progress(notes)
+
+            print(f"- {title}")
+            # Core metadata
+            for k in ("status", "due", "completed", "updated", "position", "parent"):
+                v = t.get(k)
+                if v:
+                    print(f"    {k}: {v}")
+
+            # Parsed fields from the notes block
+            if coords:
+                print(f"    coordinates: x={coords[0]}, y={coords[1]}")
+            if est is not None:
+                print(f"    time_estimate(h): {est}")
+            if prog is not None:
+                print(f"    progress(%): {prog}")
+
+            # Raw notes (kept last for readability)
+            if notes:
+                print("    notes:")
+                # indent multi-line notes nicely
+                for line in notes.splitlines():
+                    print(f"        {line}")
+
+            # Any attached links
+            links = t.get("links") or []
+            for link in links:
+                desc = link.get("description") or ""
+                href = link.get("link") or ""
+                typ  = link.get("type") or ""
+                print(f"    link: {desc} [{typ}] -> {href}")
+
+            # Show the task's id last (handy for scripting)
+            print(f"    id: {t.get('id')}")
+
+    print(f"\nTotal tasks listed: {total}")
