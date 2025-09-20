@@ -1,94 +1,148 @@
 #!/usr/bin/env python3
 """
-Pairwise stack-ranker (Tkinter) for Google Tasks -> Google Sheets (streaming writes).
+Pairwise ranker (Tkinter):
 
-Key behavior:
-- After EVERY comparison (or tie/undo that changes order), the sheet is updated.
-- If you pass --spreadsheet-id and --sheet-tab from a prior run, we read the
-  Task ID column and preload the current sorted portion to resume exactly where you left off.
-
-Usage:
-  python3 pairwise_ranker.py \
-      --task-list "My Tasks" \
-      --spreadsheet-id <YOUR_SHEET_ID> \
-      --sheet-tab "Ranking"
-
-If you omit --spreadsheet-id, we create a brand-new spreadsheet and print the ID.
+- Resumes without rewriting on start:
+    Reads the current sheet and uses it as the already-sorted baseline.
+    No write occurs until the first new placement happens.
+- Injects new Google Tasks into the existing list and sorts them via binary insertion (O(n log n)).
+- Subtasks are only compared against siblings of the same parent (if >1).
+- After every placement:
+    * Full state is written to the sheet (Status preserved),
+    * The placed Google Task is deleted (children immediately; parents when their children are done).
+- UI shows Title (button), Description, Parent (for subtasks), Link; bottom shows "Remaining N".
+- Window position/size persisted to disk across runs.
 """
 
-import argparse
+import json
+import os
+import re
 import datetime
 import tkinter as tk
-from tkinter import messagebox
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Any as AnyType
 
 from tasks_api import GoogleTasks, SEPARATOR_TITLE
 from sheets_api import SheetsClient
 
-# ------------- Task loading -------------
+# --------- Config ---------
 
-def load_active_tasks(task_list_title: Optional[str]) -> List[Dict[str, Any]]:
+def load_config() -> Dict[str, Any]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "ranker_config.json")
+    with open(path, "r") as f:
+        return json.load(f)
+
+# --------- Link extraction ---------
+
+URL_RE = re.compile(r"(https?://\S+|mailto:[^\s>]+)", re.IGNORECASE)
+
+def extract_first_link(t: Dict[str, Any]) -> str:
+    for link_obj in (t.get("links") or []):
+        url = (link_obj.get("link") or "").strip()
+        if url:
+            return url
+    txt = " ".join([(t.get("notes") or ""), (t.get("title") or "")])
+    m = URL_RE.search(txt)
+    return m.group(0) if m else ""
+
+# --------- Task loading & grouping ---------
+
+def fetch_active_tasks(task_list_title: Optional[str]) -> Tuple[
+    List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]]
+]:
+    """
+    Snapshot the Google Tasks list (active tasks only) and split into roots vs children.
+    Returns:
+      roots: list of top-level tasks (dicts with id, title, notes, _link, parent=None, etc.)
+      children_by_parent_id: { parent_id: [child task dicts] }
+      by_id: map of **all** tasks by id
+    """
     gt = GoogleTasks()
-    data = gt.getTasks(taskList=task_list_title)  # {list_title:{position:task}}
-    items = []
-    for list_title, by_pos in data.items():
-        for _pos, task in by_pos.items():
-            if task.get("title") == SEPARATOR_TITLE:
+    raw = gt.getTasks(taskList=task_list_title)  # {list_title:{position:task}}
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    roots: List[Dict[str, Any]] = []
+    children_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+
+    for list_title, by_pos in raw.items():
+        for _pos, t in by_pos.items():
+            if t.get("title") == SEPARATOR_TITLE:
                 continue
-            title = (task.get("title") or "").strip()
+            title = (t.get("title") or "").strip()
             if not title:
                 continue
-            t = dict(task)
+            t = dict(t)
             t["list_title"] = list_title
-            items.append(t)
-    return items
+            t["_link"] = extract_first_link(t)
+            tid = t.get("id")
+            if tid:
+                by_id[tid] = t
 
-# ------------- Sorter -------------
+    for t in by_id.values():
+        if t.get("parent"):
+            children_by_parent.setdefault(t["parent"], []).append(t)
+        else:
+            roots.append(t)
+
+    # Keep API "position" order as a stable baseline for first comparisons
+    roots.sort(key=lambda x: x.get("position", ""))
+    for lst in children_by_parent.values():
+        lst.sort(key=lambda x: x.get("position", ""))
+
+    # Add readable parent titles on children for UI
+    parent_title_by_id = {r.get("id"): (r.get("title") or "") for r in roots}
+    for pid, lst in children_by_parent.items():
+        ptitle = parent_title_by_id.get(pid, "")
+        for c in lst:
+            c["_parent_title"] = ptitle
+
+    return roots, children_by_parent, by_id
+
+# --------- Binary sorter (O(n log n)) ---------
 
 class PairwiseBinarySorter:
     """
-    Binary insertion with a sorted prefix preloaded from the sheet.
-    - 'sorted' holds items already placed (in final order, best at index 0).
-    - 'remaining' are candidates yet to place.
+    For each new item, binary-search the insertion position in the existing 'sorted' list.
+    Comparisons are pairwise (candidate vs mid). Complexity: O(k log m) for k new items and current length m.
     """
     def __init__(self, already_sorted: List[Dict[str, Any]], remaining: List[Dict[str, Any]]):
         self.sorted = list(already_sorted)
         self.remaining = list(remaining)
-        self.frames: List[Tuple[int, int, int, Dict[str, Any]]] = []
-        # frame: (low, high, mid, candidate)
+        self.frames: List[Tuple[int, int, int, Dict[str, Any]]] = []  # (low, high, mid, candidate)
 
     def has_work(self) -> bool:
         return bool(self.remaining) or bool(self.frames)
 
-    def start_next(self) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    def current_pair(self) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         if not self.frames:
             if not self.remaining:
                 return None
-            cand = self.remaining.pop(0)
+            candidate = self.remaining[0]  # peek
             if not self.sorted:
-                self.sorted.append(cand)
-                return self.start_next()
+                self.sorted.append(self.remaining.pop(0))
+                return self.current_pair()
             low, high = 0, len(self.sorted)
             mid = (low + high) // 2
-            self.frames.append((low, high, mid, cand))
+            self.frames.append((low, high, mid, candidate))
         low, high, mid, cand = self.frames[-1]
         return cand, self.sorted[mid]
 
-    def decide(self, prefer_left: Optional[bool], tie: bool = False) -> bool:
-        """Return True if the overall 'sorted' changed (used to trigger sheet write)."""
+    def decide(self, choose_left: bool) -> bool:
+        """
+        choose_left=True -> candidate outranks mid (search upper half).
+        Returns True once the candidate is **placed** (i.e., list changed).
+        """
         if not self.frames:
             return False
         low, high, mid, cand = self.frames.pop()
 
-        if tie:
-            self.sorted.insert(mid + 1, cand)
-            return True
+        # Consume the candidate the first time we move
+        if self.remaining and self.remaining[0].get("id") == cand.get("id"):
+            self.remaining.pop(0)
 
-        if prefer_left is True:
-            # cand better than mid -> search upper half [low, mid)
+        if choose_left:
             high = mid
         else:
-            # cand worse than mid -> search lower half (mid+1, high]
             low = mid + 1
 
         if low >= high:
@@ -99,178 +153,432 @@ class PairwiseBinarySorter:
         self.frames.append((low, high, mid, cand))
         return False
 
-    def undo(self) -> bool:
+# --------- Controller (roots first, then per-parent children) ---------
+
+class RankingController:
+    """
+    Orchestrates ranking across two phases:
+      1) Roots: global order across top-level tasks (binary insertion).
+      2) Children: for each root (with >=2 children), rank its subtasks (binary insertion).
+    It merges an existing sheet snapshot (already-sorted roots/children-by-title)
+    with newly fetched Google Tasks (remaining roots/children-by-id).
+    """
+    def __init__(
+        self,
+        gt: GoogleTasks,
+        sheets: SheetsClient,
+        spreadsheet_id: str,
+        sheet_tab: str,
+        # From Sheets (existing baseline; NO ids)
+        roots_from_sheet: List[Dict[str, Any]],
+        children_from_sheet_by_title: Dict[str, List[Dict[str, Any]]],
+        # From Google Tasks (new items to inject; WITH ids)
+        roots_from_gt: List[Dict[str, Any]],
+        children_from_gt_by_id: Dict[str, List[Dict[str, Any]]],
+    ):
+        self.gt = gt
+        self.sheets = sheets
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_tab = sheet_tab
+
+        # Existing baseline (read-only snapshot of the sheet)
+        self.baseline_roots = list(roots_from_sheet)  # dicts without ids
+        self.baseline_children_by_title = {k: list(v) for k, v in (children_from_sheet_by_title or {}).items()}
+
+        # New items to insert (with ids) – binary insertion against the existing baseline
+        self.roots_sorter = PairwiseBinarySorter(already_sorted=self.baseline_roots, remaining=roots_from_gt)
+
+        # Newly placed children during this session (by parent id)
+        self.children_sorted_by_parent_id: Dict[str, List[Dict[str, Any]]] = {}
+        self.children_remaining_by_parent_id = {pid: list(lst) for pid, lst in (children_from_gt_by_id or {}).items()}
+
+        # Active child ranker
+        self.parent_order_ids: List[str] = []  # filled after root phase completes
+        self.current_parent_id: Optional[str] = None
+        self.child_sorter: Optional[PairwiseBinarySorter] = None
+
+        # Deletion bookkeeping
+        self.deleted_ids: set[str] = set()
+
+        # IMPORTANT: no write here — that avoids any rewrite on restart.
+
+    # ---- UI-facing methods ----
+
+    def remaining_count(self) -> int:
+        n_roots = len(self.roots_sorter.remaining)
+        # Count children not yet processed
+        n_children = sum(len(v) for v in self.children_remaining_by_parent_id.values())
+        if self.child_sorter and self.child_sorter.has_work():
+            n_children += len(self.child_sorter.remaining)
+        return n_roots + n_children
+
+    def current_pair(self) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        if self.roots_sorter.has_work():
+            return self.roots_sorter.current_pair()
+
+        if not self.parent_order_ids:
+            # Build parent id order using the final order of roots that actually have ids (live parents)
+            for r in self.roots_sorter.sorted:
+                if r.get("id"):
+                    self.parent_order_ids.append(r["id"])
+            self._auto_place_trivial_children()
+            # still no write until something changes (first placement or auto-placed child)
+
+        # Activate next parent with >= 2 children
+        if not self.child_sorter or not self.child_sorter.has_work():
+            if not self._activate_next_parent_group():
+                return None
+
+        return self.child_sorter.current_pair()
+
+    def choose_left(self):
+        self._decide(True)
+
+    def choose_right(self):
+        self._decide(False)
+
+    # ---- Internals ----
+
+    def _decide(self, left: bool):
+        if self.roots_sorter.has_work():
+            placed = self.roots_sorter.decide(left)
+            if placed:
+                # If the placed root exists in Google Tasks, we'll delete it later (after its children are handled).
+                self._persist()  # first write occurs only after the first placement
+            return
+
+        if not (self.child_sorter and self.current_parent_id):
+            return
+
+        placed = self.child_sorter.decide(left)
+        if placed:
+            pid = self.current_parent_id
+            self.children_sorted_by_parent_id.setdefault(pid, list(self.child_sorter.sorted))
+            self._persist()
+            self._delete_newly_placed_children(pid)
+
+            if not self.child_sorter.has_work():
+                self._delete_parent_if_done(pid)
+                self.current_parent_id = None
+                self.child_sorter = None
+
+    def _persist(self):
         """
-        Heuristic undo:
-          - If in the middle of a search, drop the frame (one step back).
-          - Else remove the last inserted item (if any) and put it back at
-            the front of remaining.
-        Returns True if state changed.
+        Write a full, consistent snapshot:
+          - Roots = baseline roots + newly inserted roots (kept in self.roots_sorter.sorted)
+          - Children = union of:
+              a) preexisting child rows from the sheet (keyed by parent title)
+              b) newly placed children this session (keyed by parent id)
+        Status values are preserved by the writer.
         """
-        if self.frames:
-            self.frames.pop()
+        # Build the children map including both 'by id' (new) and 'by title' (existing)
+        children_union: Dict[AnyType, List[Dict[str, Any]]] = {}
+
+        # Include newly placed children by parent id
+        for pid, lst in self.children_sorted_by_parent_id.items():
+            children_union[pid] = list(lst)
+
+        # Include baseline children groups by parent **title**
+        for ptitle, lst in self.baseline_children_by_title.items():
+            # If we also have newly placed children for the same parent, append them after existing:
+            # We'll find that parent's id by looking for a root with matching title.
+            children_union.setdefault(ptitle, [])
+            children_union[ptitle].extend(lst)
+
+        self.sheets.write_full_state(
+            self.spreadsheet_id,
+            self.sheet_tab,
+            self.roots_sorter.sorted,
+            children_union
+        )
+
+    # -- Child group orchestration --
+
+    def _auto_place_trivial_children(self):
+        """
+        For any parent id with 0 children: attempt to delete the parent now (it is already ranked).
+        For any parent id with exactly 1 child remaining: place that child immediately, write, and delete it.
+        NOTE: This will cause the **first write** if any auto-placement occurs; otherwise we remain read-only.
+        """
+        wrote_any = False
+        for pid in list(self.children_remaining_by_parent_id.keys()):
+            rem = self.children_remaining_by_parent_id.get(pid, [])
+            if len(rem) == 0:
+                self._delete_parent_if_done(pid)
+                continue
+            if len(rem) == 1:
+                child = rem.pop(0)
+                self.children_sorted_by_parent_id.setdefault(pid, []).append(child)
+                self._persist()
+                wrote_any = True
+                self._delete_task(child)
+                self._delete_parent_if_done(pid)
+        # If we auto-placed none, we still have not written anything yet (respecting "no rewrite on restart").
+
+    def _activate_next_parent_group(self) -> bool:
+        while self.parent_order_ids:
+            pid = self.parent_order_ids[0]
+            rem = self.children_remaining_by_parent_id.get(pid, [])
+            placed = self.children_sorted_by_parent_id.get(pid, [])
+            total = len(rem) + len(placed)
+            if total <= 1:
+                # trivial group handled elsewhere; advance + ensure deletion
+                if rem:
+                    # single child left -> auto place then delete
+                    child = rem.pop(0)
+                    self.children_sorted_by_parent_id.setdefault(pid, []).append(child)
+                    self._persist()
+                    self._delete_task(child)
+                self._delete_parent_if_done(pid)
+                self.parent_order_ids.pop(0)
+                continue
+
+            # Start interactive ranking for this parent's children
+            self.current_parent_id = pid
+            self.child_sorter = PairwiseBinarySorter(already_sorted=placed, remaining=rem)
+            # Clear remaining list in dict so we don't double-count
+            self.children_remaining_by_parent_id[pid] = []
             return True
-        if self.sorted:
-            moved = self.sorted.pop()
-            self.remaining.insert(0, moved)
-            return True
+
         return False
 
-# ------------- UI -------------
+    # -- Deletions --
+
+    def _delete_task(self, task: Dict[str, Any]):
+        tid = task.get("id")
+        if not tid or tid in self.deleted_ids:
+            return
+        tlist = task.get("task_list_id")
+        if not tlist:
+            return
+        try:
+            self.gt.service.tasks().delete(tasklist=tlist, task=tid).execute()
+        except Exception:
+            pass
+        self.deleted_ids.add(tid)
+
+    def _delete_newly_placed_children(self, pid: Optional[str]):
+        if not pid or not self.child_sorter:
+            return
+        for t in self.child_sorter.sorted:
+            tid = t.get("id")
+            if tid and tid not in self.deleted_ids:
+                self._delete_task(t)
+
+    def _delete_parent_if_done(self, pid: Optional[str]):
+        if not pid:
+            return
+        # Parent can be deleted after all its children are placed/cleared
+        any_remaining = self.children_remaining_by_parent_id.get(pid)
+        if any_remaining:
+            return
+        parent = next((r for r in self.roots_sorter.sorted if r.get("id") == pid), None)
+        if parent:
+            self._delete_task(parent)
+
+# --------- UI (unchanged behavior: minimal info + geometry persistence) ---------
+
+class UIState:
+    def __init__(self, path: str):
+        self.path = path
+        self.geometry = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    self.geometry = (json.load(f) or {}).get("geometry")
+            except Exception:
+                self.geometry = None
+
+    def save(self, geometry: str):
+        try:
+            with open(self.path, "w") as f:
+                json.dump({"geometry": geometry}, f)
+        except Exception:
+            pass
+
+class TaskPane:
+    def __init__(self, parent_frame: tk.Frame, on_pick):
+        self.frame = tk.Frame(parent_frame, bd=1, relief="groove")
+        self.frame.pack_propagate(False)
+
+        self.title_btn = tk.Button(self.frame, text="", font=("Arial", 16, "bold"), wraplength=420, command=on_pick)
+        self.title_btn.pack(fill="x", padx=10, pady=(10, 6))
+
+        tk.Label(self.frame, text="Description:", anchor="w").pack(fill="x", padx=10)
+        self.desc = tk.Text(self.frame, height=12, wrap="word")
+        self.desc.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.desc.configure(state="disabled")
+
+        self.parent_row = tk.Frame(self.frame)
+        self.parent_row.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(self.parent_row, text="Parent:", anchor="w").pack(side="left")
+        self.parent_val = tk.Entry(self.parent_row)
+        self.parent_val.pack(side="left", fill="x", expand=True)
+        self.parent_val.configure(state="readonly")
+
+        link_row = tk.Frame(self.frame)
+        link_row.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(link_row, text="Link:", anchor="w").pack(side="left")
+        self.link_val = tk.Entry(link_row)
+        self.link_val.pack(side="left", fill="x", expand=True)
+        self.link_val.configure(state="readonly")
+
+    def set_task(self, t: Optional[Dict[str, Any]]):
+        if not t:
+            self.title_btn.config(text="(no task)", state="disabled")
+            self._set_desc("")
+            self._set_entry(self.parent_val, "")
+            self._set_entry(self.link_val, "")
+            self.parent_row.forget()
+            return
+
+        self.title_btn.config(text=(t.get("title") or "").strip(), state="normal")
+        self._set_desc((t.get("notes") or "").strip())
+
+        parent_title = (t.get("_parent_title") or "").strip()
+        if parent_title:
+            self.parent_row.pack(fill="x", padx=10, pady=(0, 4))
+            self._set_entry(self.parent_val, parent_title)
+        else:
+            self.parent_row.forget()
+
+        self._set_entry(self.link_val, (t.get("_link") or "").strip())
+
+    def _set_desc(self, text: str):
+        self.desc.configure(state="normal")
+        self.desc.delete("1.0", "end")
+        self.desc.insert("1.0", text)
+        self.desc.configure(state="disabled")
+
+    def _set_entry(self, ent: tk.Entry, value: str):
+        ent.configure(state="normal")
+        ent.delete(0, "end")
+        ent.insert(0, value)
+        ent.configure(state="readonly")
 
 class RankerUI:
-    def __init__(self, root, sorter: PairwiseBinarySorter, on_change):
-        self.root = root
-        self.sorter = sorter
-        self.on_change = on_change  # callback to persist sheet after order changes
+    def __init__(self, controller: RankingController, state_path: str):
+        self.controller = controller
+        self.state = UIState(state_path)
+
+        self.root = tk.Tk()
         self.root.title("Pairwise Task Ranker")
 
-        self.progress = tk.Label(root, text="", font=("Arial", 12))
-        self.progress.pack(pady=(8, 4))
+        if self.state.geometry:
+            self.root.geometry(self.state.geometry)
 
-        frame = tk.Frame(root)
-        frame.pack(fill="both", expand=True, padx=12, pady=8)
+        self._geom_after = None
+        def on_conf(_e):
+            if self._geom_after:
+                self.root.after_cancel(self._geom_after)
+            self._geom_after = self.root.after(250, self._save_geometry)
+        self.root.bind("<Configure>", on_conf)
 
-        self.left_btn = tk.Button(frame, text="", font=("Arial", 14), wraplength=380,
-                                  command=lambda: self._choose(True))
-        self.left_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        def on_close():
+            self._save_geometry()
+            self.root.destroy()
+        self.root.protocol("WM_DELETE_WINDOW", on_close)
 
-        self.right_btn = tk.Button(frame, text="", font=("Arial", 14), wraplength=380,
-                                   command=lambda: self._choose(False))
-        self.right_btn.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        tk.Label(
+            self.root,
+            text="Which of the following two tasks is more important for you?",
+            font=("Arial", 14)
+        ).pack(fill="x", padx=12, pady=(10, 6))
 
-        frame.grid_columnconfigure(0, weight=1)
-        frame.grid_columnconfigure(1, weight=1)
+        mid = tk.Frame(self.root)
+        mid.pack(fill="both", expand=True, padx=12, pady=6)
 
-        ctrl = tk.Frame(root)
-        ctrl.pack(fill="x", padx=12, pady=(4, 10))
-        tk.Button(ctrl, text="Tie", command=self._tie).pack(side="left")
-        tk.Button(ctrl, text="Undo", command=self._undo).pack(side="left", padx=6)
-        tk.Button(ctrl, text="Finish", command=self._finish).pack(side="right")
+        self.left = TaskPane(mid, on_pick=self._pick_left)
+        self.left.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.right = TaskPane(mid, on_pick=self._pick_right)
+        self.right.frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        # shortcuts
-        self.root.bind("<Left>", lambda e: self._choose(True))
-        self.root.bind("<Right>", lambda e: self._choose(False))
-        self.root.bind("<space>", lambda e: self._tie())
-        self.root.bind("<BackSpace>", lambda e: self._undo())
-        self.root.bind("<Escape>", lambda e: self._finish())
+        mid.grid_columnconfigure(0, weight=1, uniform="col")
+        mid.grid_columnconfigure(1, weight=1, uniform="col")
+        mid.grid_rowconfigure(0, weight=1)
+
+        self.remaining = tk.Label(self.root, text="Remaining 0", font=("Arial", 12))
+        self.remaining.pack(fill="x", padx=12, pady=(6, 12))
+
+        self.root.bind("<Left>",  lambda e: self._pick_left())
+        self.root.bind("<Right>", lambda e: self._pick_right())
 
         self._refresh()
 
-    @staticmethod
-    def _label(t: Dict[str, Any]) -> str:
-        title = (t.get("title") or "").strip()
-        notes = (t.get("notes") or "").strip().splitlines()[0] if t.get("notes") else ""
-        where = t.get("list_title") or ""
-        return f"{title}\n\n{notes}\n\n({where})" if notes else f"{title}\n\n({where})"
-
-    def _refresh_progress(self):
-        total = len(self.sorter.sorted) + len(self.sorter.remaining)
-        placed = len(self.sorter.sorted)
-        self.progress.config(text=f"Placed {placed}/{total} • Remaining {len(self.sorter.remaining)}")
+    def _save_geometry(self):
+        try:
+            self.state.save(self.root.wm_geometry())
+        except Exception:
+            pass
 
     def _refresh(self):
-        self._refresh_progress()
-        pair = self.sorter.start_next()
+        pair = self.controller.current_pair()
         if not pair:
-            self.left_btn.config(text="(done)", state="disabled")
-            self.right_btn.config(text="(done)", state="disabled")
+            self.left.set_task(None)
+            self.right.set_task(None)
+            self.remaining.config(text="Remaining 0")
+            self.root.after(600, self.root.destroy)
             return
         a, b = pair
-        self.left_btn.config(text=self._label(a), state="normal")
-        self.right_btn.config(text=self._label(b), state="normal")
+        self.left.set_task(a)
+        self.right.set_task(b)
+        self.remaining.config(text=f"Remaining {self.controller.remaining_count()}")
 
-    def _choose(self, left: bool):
-        changed = self.sorter.decide(prefer_left=left, tie=False)
-        if changed:
-            self.on_change(self.sorter.sorted)  # persist immediately
+    def _pick_left(self):
+        self.controller.choose_left()
         self._refresh()
 
-    def _tie(self):
-        changed = self.sorter.decide(prefer_left=None, tie=True)
-        if changed:
-            self.on_change(self.sorter.sorted)
+    def _pick_right(self):
+        self.controller.choose_right()
         self._refresh()
 
-    def _undo(self):
-        if self.sorter.undo():
-            self.on_change(self.sorter.sorted)  # persist current order after undo
-            self._refresh()
+    def run(self):
+        self.root.mainloop()
 
-    def _finish(self):
-        if not self.sorter.sorted:
-            if not messagebox.askyesno("Finish", "No items ranked yet. Exit anyway?"):
-                return
-        self.on_change(self.sorter.sorted)  # one last write
-        self.root.quit()
-
-# ------------- Glue / Resume logic -------------
-
-def build_resume_state(all_tasks: List[Dict[str, Any]], existing_ids: List[str]):
-    by_id = {t.get("id"): t for t in all_tasks if t.get("id")}
-    already_sorted = []
-    for tid in existing_ids:
-        t = by_id.get(tid)
-        if t:
-            already_sorted.append(t)
-    # anything not already placed goes into remaining
-    placed_ids = {t.get("id") for t in already_sorted}
-    remaining = [t for t in all_tasks if t.get("id") not in placed_ids]
-    return already_sorted, remaining
-
-# ------------- Main -------------
+# --------- Main ---------
 
 def main():
-    parser = argparse.ArgumentParser(description="Pairwise Tk ranker with streaming writes to Sheets")
-    parser.add_argument("--task-list", default=None, help="Filter to a specific Google Task list title.")
-    parser.add_argument("--spreadsheet-id", default=None, help="Write to this spreadsheet. If omitted, a new one is created.")
-    parser.add_argument("--sheet-tab", default="Ranking", help="Worksheet tab title (default: Ranking).")
-    parser.add_argument("--sheet-title", default=None, help="Only used when creating a new spreadsheet.")
-    args = parser.parse_args()
+    cfg = load_config()
+    task_list_name = (cfg.get("task_list") or "").strip() or None
+    spreadsheet_id = (cfg.get("spreadsheet_id") or "").strip()
+    sheet_tab = (cfg.get("sheet_tab") or "Ranking").strip()
+    sheet_title = (cfg.get("sheet_title") or f"Task Stack Rank ({datetime.datetime.now().strftime('%Y-%m-%d %H.%M')})").strip()
+    credentials_dir = (cfg.get("credentials_dir") or "").strip() or None
+    ui_state_path = (cfg.get("ui_state_path") or "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_state.json")
 
-    # Load tasks
-    tasks = load_active_tasks(args.task_list)
-    if not tasks:
-        print("No active tasks found. Nothing to rank.")
-        return
-
-    # Sheets client
-    sheets = SheetsClient()
-
-    # Create or use provided spreadsheet
-    if args.spreadsheet_id:
-        spreadsheet_id = args.spreadsheet_id
-        tab_title = sheets.ensure_tab(spreadsheet_id, args.sheet_tab)
+    sheets = SheetsClient(credentials_dir=credentials_dir)
+    if not spreadsheet_id:
+        spreadsheet_id = sheets.create_spreadsheet(sheet_title)
+        sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
+        print(f"[Created spreadsheet] ID: {spreadsheet_id} • Tab: {sheet_tab}")
     else:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H.%M")
-        spreadsheet_title = args.sheet_title or f"Task Stack Rank ({ts})"
-        spreadsheet_id = sheets.create_spreadsheet(spreadsheet_title)
-        tab_title = sheets.ensure_tab(spreadsheet_id, args.sheet_tab)
-        print(f"[Created spreadsheet] ID: {spreadsheet_id}  •  Tab: {tab_title}")
+        sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
 
-    # Resume: read current ranked order (Task ID column), preload sorter
-    existing_ids = sheets.read_current_rank_ids(spreadsheet_id, tab_title)
-    already_sorted, remaining = build_resume_state(tasks, existing_ids)
-    sorter = PairwiseBinarySorter(already_sorted, remaining)
+    # Always ensure the dropdown + colors exist; this is idempotent.
+    sheets.ensure_status_dropdown_and_colors(spreadsheet_id, sheet_tab)
 
-    # Define persistence callback
-    def persist(sorted_list: List[Dict[str, Any]]):
-        sheets.write_full_rank(spreadsheet_id, tab_title, sorted_list)
-        # (optional) print a tiny heartbeat
-        # print(f"Wrote {len(sorted_list)} rows to Sheets.")
+    # 1) Read the existing sheet (NO WRITES HERE).
+    roots_from_sheet, children_from_sheet_by_title = sheets.read_full_state(spreadsheet_id, sheet_tab)
 
-    # Initial write (in case we resumed with existing rows or start empty)
-    persist(sorter.sorted)
+    # 2) Fetch current Google Tasks snapshot (new items to inject).
+    gt = GoogleTasks()
+    roots_from_gt, children_from_gt_by_id, _by_id = fetch_active_tasks(task_list_name)
 
-    # Fire up the UI
-    root = tk.Tk()
-    ui = RankerUI(root, sorter, persist)
-    root.mainloop()
+    # 3) Build the controller using the sheet as the 'already_sorted' baseline.
+    controller = RankingController(
+        gt=gt,
+        sheets=sheets,
+        spreadsheet_id=spreadsheet_id,
+        sheet_tab=sheet_tab,
+        roots_from_sheet=roots_from_sheet,
+        children_from_sheet_by_title=children_from_sheet_by_title,
+        roots_from_gt=roots_from_gt,
+        children_from_gt_by_id=children_from_gt_by_id,
+    )
 
-    # Final pointer for convenience
-    print("\nDone.")
-    print(f"Spreadsheet ID: {spreadsheet_id}")
-    print(f"Tab: {tab_title}")
+    # 4) Run the UI (still O(n log n) thanks to PairwiseBinarySorter).
+    ui = RankerUI(controller, state_path=ui_state_path)
+    ui.run()
 
 if __name__ == "__main__":
     main()

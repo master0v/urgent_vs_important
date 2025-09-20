@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """
-Minimal Google Sheets helper for the Pairwise Ranker.
+Google Sheets helper for the Pairwise Ranker.
 
-Capabilities:
-- Auth (separate token file from Google Tasks)
-- Create spreadsheet, create/ensure tab
-- Read current rank (by Task ID column)
-- Write full ranked table (rewrites the sheet each time for simplicity + correctness)
+Columns:
+  A: Status (dropdown: not started / in progress / done)  [with color rules]
+  B: Rank        (only on root rows)
+  C: Parent Title   (blank for roots)
+  D: Title
+  E: Description
+  F: Link
+
+Key capabilities:
+- read_full_state(): parse the existing sheet into:
+    * roots_in_order: list of dicts (title, notes, _link) in the existing top-level order
+    * children_by_parent_title: { parent_title: [child dicts in current order] }
+  This allows resuming without rewriting on start.
+- write_full_state(): rewrite the entire tab using the current in-memory state,
+  **preserving Status values** by matching rows on (Parent Title, Title).
+- ensure_status_dropdown_and_colors(): installs the data validation + color rules.
 """
 
 import os
 import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -19,18 +30,23 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-HEADER = ["Rank", "Title", "List", "Notes (first line)", "Task ID"]
+
+HEADER = ["Status", "Rank", "Parent Title", "Title", "Description", "Link"]
+STATUS_VALUES = ["not started", "in progress", "done"]
+
+# subtle readable backgrounds
+COLOR_RED    = {"red": 0.96, "green": 0.80, "blue": 0.80}
+COLOR_ORANGE = {"red": 1.00, "green": 0.90, "blue": 0.80}
+COLOR_GREEN  = {"red": 0.85, "green": 0.94, "blue": 0.83}
 
 class SheetsClient:
     def __init__(self, credentials_dir: Optional[str] = None):
-        """
-        credentials_dir: folder with credentials.json (default = script folder).
-        Tokens are stored as token_sheets.json in the same folder.
-        """
         here = os.path.dirname(os.path.abspath(__file__))
         self._dir = credentials_dir or here
         self._creds = self._auth()
         self.service = build("sheets", "v4", credentials=self._creds)
+
+    # ---------- auth ----------
 
     def _auth(self):
         creds_path = os.path.join(self._dir, "credentials.json")
@@ -71,7 +87,7 @@ class SheetsClient:
 
         return creds
 
-    # ---- Spreadsheet / Tab management ----
+    # ---------- spreadsheet / tab ----------
 
     def create_spreadsheet(self, title: str) -> str:
         body = {"properties": {"title": title}}
@@ -79,83 +95,225 @@ class SheetsClient:
         return created["spreadsheetId"]
 
     def ensure_tab(self, spreadsheet_id: str, sheet_title: str) -> str:
-        """
-        Ensures a tab with the given title exists; if the title is taken, creates a timestamped one.
-        Returns the (possibly adjusted) tab title you should write to.
-        """
         meta = self.service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         existing_titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
         if sheet_title in existing_titles:
             return sheet_title
-
-        # try to add with requested title, and if it fails, add with a suffix
         try:
             reqs = [{"addSheet": {"properties": {"title": sheet_title}}}]
-            self.service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": reqs}
+            ).execute()
             return sheet_title
         except Exception:
             suffix = datetime.datetime.now().strftime("%Y-%m-%d %H.%M.%S")
             adjusted = f"{sheet_title} ({suffix})"
             reqs = [{"addSheet": {"properties": {"title": adjusted}}}]
-            self.service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body={"requests": reqs}
+            ).execute()
             return adjusted
 
-    # ---- Read / Write ----
+    def _get_sheet_id(self, spreadsheet_id: str, sheet_title: str) -> int:
+        meta = self.service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        for s in meta.get("sheets", []):
+            if s["properties"]["title"] == sheet_title:
+                return int(s["properties"]["sheetId"])
+        raise RuntimeError(f"Sheet '{sheet_title}' not found in spreadsheet.")
 
-    def read_current_rank_ids(self, spreadsheet_id: str, sheet_title: str) -> List[str]:
+    # ---------- validation & colors ----------
+
+    def ensure_status_dropdown_and_colors(self, spreadsheet_id: str, sheet_title: str):
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_title)
+
+        status_range = {
+            "sheetId": sheet_id,
+            "startRowIndex": 1,  # skip header
+            "startColumnIndex": 0,
+            "endColumnIndex": 1
+        }
+
+        requests = [
+            {
+                "setDataValidation": {
+                    "range": status_range,
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [{"userEnteredValue": v} for v in STATUS_VALUES]
+                        },
+                        "strict": True,
+                        "showCustomUi": True
+                    }
+                }
+            },
+            # Conditional formats for each status
+            self._cf_eq("not started", COLOR_RED, status_range, 0),
+            self._cf_eq("in progress", COLOR_ORANGE, status_range, 1),
+            self._cf_eq("done", COLOR_GREEN, status_range, 2),
+        ]
+
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}
+        ).execute()
+
+    def _cf_eq(self, val: str, color: Dict[str, float], rng: Dict[str, int], index: int):
+        return {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [rng],
+                    "booleanRule": {
+                        "condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": val}]},
+                        "format": {"backgroundColor": color}
+                    }
+                },
+                "index": index
+            }
+        }
+
+    # ---------- reads & writes ----------
+
+    def read_full_state(
+        self,
+        spreadsheet_id: str,
+        sheet_title: str
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
         """
-        Reads the Task ID column from the sheet (skips header).
-        Returns IDs in order (top to bottom).
-        If the sheet is empty or missing, returns [].
+        Parse the existing sheet (if any) into roots + children-by-parent (keyed by Parent Title).
+        We intentionally do NOT write anything here—this enables truly non-destructive resume.
+
+        Returns:
+          roots_in_order: list of dicts with keys: title, notes, _link
+          children_by_parent_title: { parent_title: [ {title, notes, _link}, ... ] }
         """
-        rng = f"{sheet_title}!A1:E1000000"  # wide range; we’ll just read what’s there
+        rng = f"{sheet_title}!A1:F1000000"
         try:
             resp = self.service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=rng
             ).execute()
         except Exception:
-            return []
+            return [], {}
 
-        values = resp.get("values", [])
-        if not values:
-            return []
+        rows = resp.get("values", [])
+        if not rows:
+            return [], {}
 
-        # Expect header in row 1. Task ID is column E (index 4).
-        ids = []
-        for i, row in enumerate(values):
-            if i == 0:
-                # Verify header or just skip first row
+        # Normalize rows to 6 columns
+        norm = [(r + [""] * 6)[:6] for r in rows]
+        # Header sanity
+        if norm[0][:len(HEADER)] != HEADER[:len(norm[0])]:
+            # If header is missing or unexpected, treat as empty and let later writes normalize it.
+            return [], {}
+
+        roots: List[Dict[str, Any]] = []
+        children_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+
+        current_parent_title: Optional[str] = None
+        for i, row in enumerate(norm[1:], start=2):
+            status, rank, parent_title, title, desc, link = row
+            title = (title or "").strip()
+            parent_title = (parent_title or "").strip()
+            if not title:
                 continue
-            if len(row) >= 5:
-                tid = (row[4] or "").strip()
-                if tid:
-                    ids.append(tid)
-        return ids
 
-    def write_full_rank(
+            task_row = {
+                "title": title,
+                "notes": desc or "",
+                "_link": link or "",
+                # No IDs here (by design)—this is a sheet snapshot.
+            }
+
+            if (rank or "").strip():  # a root row (B has a value)
+                roots.append(task_row)
+                current_parent_title = title
+            else:
+                # child row: parent is explicit in col C; if blank, fall back to last seen root
+                ptitle = parent_title or (current_parent_title or "")
+                if ptitle:
+                    children_by_parent.setdefault(ptitle, []).append(task_row)
+
+        return roots, children_by_parent
+
+    def _read_existing_status_map(self, spreadsheet_id: str, sheet_title: str) -> Dict[Tuple[str, str], str]:
+        """
+        Mapping (Parent Title, Title) -> Status for preserving the Status on rewrite.
+        """
+        rng = f"{sheet_title}!A1:F1000000"
+        try:
+            resp = self.service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=rng
+            ).execute()
+        except Exception:
+            return {}
+        rows = resp.get("values", [])
+        if not rows:
+            return {}
+
+        m: Dict[Tuple[str, str], str] = {}
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue  # header
+            row = (row + [""] * 6)[:6]
+            status, _rank, parent_title, title, _desc, _link = row
+            key = ((parent_title or "").strip(), (title or "").strip())
+            if key[1]:
+                m[key] = (status or "").strip()
+        return m
+
+    def clear_values(self, spreadsheet_id: str, sheet_title: str):
+        self.service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A:Z"
+        ).execute()
+
+    def write_full_state(
         self,
         spreadsheet_id: str,
         sheet_title: str,
-        ranked_tasks: List[Dict[str, Any]],
+        roots_in_order: List[Dict[str, Any]],
+        children_by_parent: Dict[Any, List[Dict[str, Any]]],
     ):
         """
-        Rewrites the sheet with HEADER + ranked rows (Rank, Title, List, Notes, Task ID).
+        Rewrite the sheet with header + all rows, preserving Status per (Parent Title, Title).
+        children_by_parent can be keyed by:
+          - parent task id (when available), OR
+          - parent title (string), allowing us to carry forward existing child rows from a prior session.
         """
-        rows: List[List[str]] = [list(HEADER)]
-        for idx, t in enumerate(ranked_tasks, start=1):
-            title = (t.get("title") or "").strip()
-            notes = (t.get("notes") or "").strip().splitlines()[0] if t.get("notes") else ""
-            rows.append([str(idx), title, t.get("list_title") or "", notes, t.get("id") or ""])
+        status_map = self._read_existing_status_map(spreadsheet_id, sheet_title)
 
-        rng = f"{sheet_title}!A1"
+        def row_for(task: Dict[str, Any], rank_str: str, parent_title: str) -> List[str]:
+            title = (task.get("title") or "").strip()
+            desc  = (task.get("notes") or "").strip()
+            link  = (task.get("_link") or "").strip()
+            status = status_map.get((parent_title or "", title), "")
+            return [status, rank_str, parent_title, title, desc, link]
+
+        rows: List[List[str]] = [list(HEADER)]
+
+        # Build lookups for children keyed by both id and title for convenience
+        by_id_or_title = {}
+        for k, lst in (children_by_parent or {}).items():
+            by_id_or_title[k] = lst
+
+        for idx, root in enumerate(roots_in_order, start=1):
+            root_title = (root.get("title") or "").strip()
+            rows.append(row_for(root, str(idx), ""))
+
+            # Attempt to pull children by id first, then by title
+            pid = root.get("id")
+            child_list = None
+            if pid is not None and pid in by_id_or_title:
+                child_list = by_id_or_title.get(pid, [])
+            if child_list is None or len(child_list) == 0:
+                child_list = by_id_or_title.get(root_title, [])
+
+            for ch in (child_list or []):
+                rows.append(row_for(ch, "", root_title))
+
+        # Final write
+        self.clear_values(spreadsheet_id, sheet_title)
         self.service.spreadsheets().values().update(
-            spreadsheetId=spreadsheets_id_or_raise(spreadsheet_id),
-            range=rng,
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_title}!A1",
             valueInputOption="RAW",
             body={"values": rows},
         ).execute()
-
-def spreadsheets_id_or_raise(spreadsheet_id: Optional[str]) -> str:
-    if not spreadsheet_id:
-        raise ValueError("Spreadsheet ID is required.")
-    return spreadsheet_id
