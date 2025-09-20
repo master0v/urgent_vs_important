@@ -16,3 +16,7 @@ to get OAuth token:
 https://console.cloud.google.com/auth/clients/
 2. under "Client Secrets" click "Download JSON"
 3. rename/move to credentials.json in the application folder
+
+## Pairwise Task Ranker pairwise_comparison.py
+
+pulls your active Google Tasks, lets you compare two at a time, and writes the evolving priority order to Google Sheets. It resumes cleanly from the current sheet order (no rewrite on start), injects any new tasks via binary insertion (O(n log n)), and ranks subtasks only against their siblings.

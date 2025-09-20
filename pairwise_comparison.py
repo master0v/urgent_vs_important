@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Pairwise ranker (Tkinter):
+Pairwise ranker (Tkinter) — robust restart + correct deletions.
 
-- Resumes without rewriting on start:
-    Reads the current sheet and uses it as the already-sorted baseline.
-    No write occurs until the first new placement happens.
-- Injects new Google Tasks into the existing list and sorts them via binary insertion (O(n log n)).
-- Subtasks are only compared against siblings of the same parent (if >1).
-- After every placement:
-    * Full state is written to the sheet (Status preserved),
-    * The placed Google Task is deleted (children immediately; parents when their children are done).
-- UI shows Title (button), Description, Parent (for subtasks), Link; bottom shows "Remaining N".
-- Window position/size persisted to disk across runs.
+Fixes:
+- Startup reconciliation: attach Google Task IDs to sheet rows by matching Title (case/space-normalized),
+  so we never compare a task with itself after restart.
+- Parent deletion: delete once there are NO unprocessed children left (ignoring already-written ones).
+- Children are deleted immediately after being written (unchanged).
+- Optional: set DELETE_PARENTS_IMMEDIATELY = True to delete parents as soon as they’re inserted into the sheet.
+
+Safe default:
+- DELETE_PARENTS_IMMEDIATELY = False  (prevents losing subtasks if you quit mid-session)
 """
 
 import json
@@ -23,6 +22,9 @@ from typing import List, Dict, Any, Optional, Tuple, Any as AnyType
 
 from tasks_api import GoogleTasks, SEPARATOR_TITLE
 from sheets_api import SheetsClient
+
+# ---- behavior switches ----
+DELETE_PARENTS_IMMEDIATELY = False  # set to True only if you accept that deleting a parent may erase its subtasks in Google Tasks
 
 # --------- Config ---------
 
@@ -98,17 +100,13 @@ def fetch_active_tasks(task_list_title: Optional[str]) -> Tuple[
 
     return roots, children_by_parent, by_id
 
-# --------- Binary sorter (O(n log n)) ---------
+# --------- Binary sorter ---------
 
 class PairwiseBinarySorter:
-    """
-    For each new item, binary-search the insertion position in the existing 'sorted' list.
-    Comparisons are pairwise (candidate vs mid). Complexity: O(k log m) for k new items and current length m.
-    """
     def __init__(self, already_sorted: List[Dict[str, Any]], remaining: List[Dict[str, Any]]):
         self.sorted = list(already_sorted)
         self.remaining = list(remaining)
-        self.frames: List[Tuple[int, int, int, Dict[str, Any]]] = []  # (low, high, mid, candidate)
+        self.frames: List[Tuple[int, int, int, Dict[str, Any]]] = []
 
     def has_work(self) -> bool:
         return bool(self.remaining) or bool(self.frames)
@@ -117,7 +115,7 @@ class PairwiseBinarySorter:
         if not self.frames:
             if not self.remaining:
                 return None
-            candidate = self.remaining[0]  # peek
+            candidate = self.remaining[0]
             if not self.sorted:
                 self.sorted.append(self.remaining.pop(0))
                 return self.current_pair()
@@ -127,13 +125,13 @@ class PairwiseBinarySorter:
         low, high, mid, cand = self.frames[-1]
         return cand, self.sorted[mid]
 
-    def decide(self, choose_left: bool) -> bool:
+    def decide(self, choose_left: bool) -> Optional[Dict[str, Any]]:
         """
         choose_left=True -> candidate outranks mid (search upper half).
-        Returns True once the candidate is **placed** (i.e., list changed).
+        Returns the placed candidate dict when it is finally inserted; otherwise None.
         """
         if not self.frames:
-            return False
+            return None
         low, high, mid, cand = self.frames.pop()
 
         # Consume the candidate the first time we move
@@ -147,21 +145,21 @@ class PairwiseBinarySorter:
 
         if low >= high:
             self.sorted.insert(low, cand)
-            return True
-
+            return cand  # placed!
         mid = (low + high) // 2
         self.frames.append((low, high, mid, cand))
-        return False
+        return None
 
-# --------- Controller (roots first, then per-parent children) ---------
+# --------- Controller ---------
 
 class RankingController:
     """
-    Orchestrates ranking across two phases:
-      1) Roots: global order across top-level tasks (binary insertion).
-      2) Children: for each root (with >=2 children), rank its subtasks (binary insertion).
-    It merges an existing sheet snapshot (already-sorted roots/children-by-title)
-    with newly fetched Google Tasks (remaining roots/children-by-id).
+    - Reconciles Sheet rows with Google Tasks by Title on startup (attaches IDs, filters duplicates).
+    - Roots ranked first, then children per parent.
+    - Writes after every decision.
+    - Children deleted immediately after writing; parents deleted when no unprocessed children remain
+      (or immediately if DELETE_PARENTS_IMMEDIATELY=True).
+    - Final cleanup on flush/exit.
     """
     def __init__(
         self,
@@ -169,10 +167,8 @@ class RankingController:
         sheets: SheetsClient,
         spreadsheet_id: str,
         sheet_tab: str,
-        # From Sheets (existing baseline; NO ids)
         roots_from_sheet: List[Dict[str, Any]],
         children_from_sheet_by_title: Dict[str, List[Dict[str, Any]]],
-        # From Google Tasks (new items to inject; WITH ids)
         roots_from_gt: List[Dict[str, Any]],
         children_from_gt_by_id: Dict[str, List[Dict[str, Any]]],
     ):
@@ -181,32 +177,120 @@ class RankingController:
         self.spreadsheet_id = spreadsheet_id
         self.sheet_tab = sheet_tab
 
-        # Existing baseline (read-only snapshot of the sheet)
-        self.baseline_roots = list(roots_from_sheet)  # dicts without ids
+        # Baseline from the sheet (no ids initially)
+        self.baseline_roots = list(roots_from_sheet)
         self.baseline_children_by_title = {k: list(v) for k, v in (children_from_sheet_by_title or {}).items()}
 
-        # New items to insert (with ids) – binary insertion against the existing baseline
-        self.roots_sorter = PairwiseBinarySorter(already_sorted=self.baseline_roots, remaining=roots_from_gt)
+        # Reconcile sheet vs Google Tasks by Title (case/space normalized)
+        remaining_roots_from_gt, remaining_children_by_id = \
+            self._reconcile_sheet_with_google(roots_from_gt, children_from_gt_by_id)
 
-        # Newly placed children during this session (by parent id)
+        # Sorters & state
+        self.roots_sorter = PairwiseBinarySorter(already_sorted=self.baseline_roots, remaining=remaining_roots_from_gt)
         self.children_sorted_by_parent_id: Dict[str, List[Dict[str, Any]]] = {}
-        self.children_remaining_by_parent_id = {pid: list(lst) for pid, lst in (children_from_gt_by_id or {}).items()}
+        self.children_remaining_by_parent_id = {pid: list(lst) for pid, lst in (remaining_children_by_id or {}).items()}
 
-        # Active child ranker
-        self.parent_order_ids: List[str] = []  # filled after root phase completes
+        # Ensure zero-child parents are tracked (for cleanup)
+        self._seed_empty_child_groups_for_all_parents()
+
+        # Parent ordering (for child phase)
+        self.parent_order_ids: List[str] = []
         self.current_parent_id: Optional[str] = None
         self.child_sorter: Optional[PairwiseBinarySorter] = None
 
         # Deletion bookkeeping
         self.deleted_ids: set[str] = set()
 
-        # IMPORTANT: no write here — that avoids any rewrite on restart.
+    # ---- normalization & reconciliation ----
 
-    # ---- UI-facing methods ----
+    @staticmethod
+    def _norm(s: Optional[str]) -> str:
+        s = (s or "").strip()
+        # collapse inner whitespace and lowercase
+        return " ".join(s.split()).lower()
+
+    def _reconcile_sheet_with_google(
+        self,
+        roots_from_gt: List[Dict[str, Any]],
+        children_from_gt_by_id: Dict[str, List[Dict[str, Any]]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+        """
+        Attach Google Task IDs to sheet rows (roots + children) where titles match,
+        and remove those items from the "remaining to-rank" lists so we don't compare against ourselves.
+        """
+        # --- roots ---
+        title_to_sheet_root: Dict[str, Dict[str, Any]] = {}
+        for r in self.baseline_roots:
+            t = self._norm(r.get("title"))
+            if t:
+                title_to_sheet_root[t] = r
+
+        remaining_roots: List[Dict[str, Any]] = []
+        # Also build a parent-title map by id as we go
+        parent_title_by_id: Dict[str, str] = {}
+
+        for gr in roots_from_gt:
+            nt = self._norm(gr.get("title"))
+            if not nt:
+                continue
+            sheet_root = title_to_sheet_root.get(nt)
+            if sheet_root:
+                # Attach identifiers/metadata onto the sheet row
+                for k in ("id", "task_list_id", "position", "list_title"):
+                    if gr.get(k) is not None:
+                        sheet_root[k] = gr.get(k)
+                # Prefer existing Description/Link from sheet; fill blanks from GT snapshot
+                if not (sheet_root.get("_link") or "").strip():
+                    sheet_root["_link"] = (gr.get("_link") or "").strip()
+                if not (sheet_root.get("notes") or "").strip():
+                    sheet_root["notes"] = (gr.get("notes") or "").strip()
+                if gr.get("id"):
+                    parent_title_by_id[gr["id"]] = sheet_root.get("title") or ""
+            else:
+                remaining_roots.append(gr)
+                if gr.get("id"):
+                    parent_title_by_id[gr["id"]] = gr.get("title") or ""
+
+        # --- children ---
+        # Build child title index from the sheet per parent title
+        children_index_by_parent_title: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for ptitle, lst in self.baseline_children_by_title.items():
+            idx = {self._norm(c.get("title")): c for c in lst if (c.get("title") or "").strip()}
+            children_index_by_parent_title[ptitle] = idx
+
+        remaining_children: Dict[str, List[Dict[str, Any]]] = {}
+        for pid, glist in (children_from_gt_by_id or {}).items():
+            ptitle = parent_title_by_id.get(pid, "")
+            idx = children_index_by_parent_title.get(ptitle, {})
+            for gc in glist:
+                nt = self._norm(gc.get("title"))
+                if nt and nt in idx:
+                    # Attach identifiers/metadata to the sheet child row
+                    sc = idx[nt]
+                    for k in ("id", "task_list_id", "position", "list_title", "parent"):
+                        if gc.get(k) is not None:
+                            sc[k] = gc.get(k)
+                    if not (sc.get("_link") or "").strip():
+                        sc["_link"] = (gc.get("_link") or "").strip()
+                    if not (sc.get("notes") or "").strip():
+                        sc["notes"] = (gc.get("notes") or "").strip()
+                else:
+                    remaining_children.setdefault(pid, []).append(gc)
+
+        return remaining_roots, remaining_children
+
+    def _seed_empty_child_groups_for_all_parents(self):
+        # Ensure every root with an ID has a bucket, even if no children
+        for r in self.baseline_roots + self.roots_sorter.remaining:
+            pid = r.get("id")
+            if pid and pid not in self.children_remaining_by_parent_id:
+                self.children_remaining_by_parent_id[pid] = []
+
+    # ---- UI-facing API ----
 
     def remaining_count(self) -> int:
         n_roots = len(self.roots_sorter.remaining)
-        # Count children not yet processed
+        # Only count children not yet processed (remaining + in-progress sorter)
         n_children = sum(len(v) for v in self.children_remaining_by_parent_id.values())
         if self.child_sorter and self.child_sorter.has_work():
             n_children += len(self.child_sorter.remaining)
@@ -217,14 +301,12 @@ class RankingController:
             return self.roots_sorter.current_pair()
 
         if not self.parent_order_ids:
-            # Build parent id order using the final order of roots that actually have ids (live parents)
+            # Build parent order from final root order
             for r in self.roots_sorter.sorted:
                 if r.get("id"):
                     self.parent_order_ids.append(r["id"])
             self._auto_place_trivial_children()
-            # still no write until something changes (first placement or auto-placed child)
 
-        # Activate next parent with >= 2 children
         if not self.child_sorter or not self.child_sorter.has_work():
             if not self._activate_next_parent_group():
                 return None
@@ -237,51 +319,56 @@ class RankingController:
     def choose_right(self):
         self._decide(False)
 
-    # ---- Internals ----
+    def flush(self):
+        """Write a snapshot and perform cleanup for any deletable parents."""
+        self._persist()
+        self._final_cleanup_for_parents()
+
+    # ---- internal decision logic ----
 
     def _decide(self, left: bool):
+        # Root phase
         if self.roots_sorter.has_work():
-            placed = self.roots_sorter.decide(left)
-            if placed:
-                # If the placed root exists in Google Tasks, we'll delete it later (after its children are handled).
-                self._persist()  # first write occurs only after the first placement
+            placed_root = self.roots_sorter.decide(left)
+            if placed_root:
+                self._persist()
+
+                # Delete parent now if requested OR if it has no unprocessed children
+                pid = placed_root.get("id")
+                if pid:
+                    if DELETE_PARENTS_IMMEDIATELY:
+                        self._delete_task(placed_root)
+                    else:
+                        self._delete_parent_if_ready(pid)
             return
 
+        # Child phase
         if not (self.child_sorter and self.current_parent_id):
             return
 
-        placed = self.child_sorter.decide(left)
-        if placed:
+        placed_child = self.child_sorter.decide(left)
+        if placed_child:
             pid = self.current_parent_id
             self.children_sorted_by_parent_id.setdefault(pid, list(self.child_sorter.sorted))
-            self._persist()
-            self._delete_newly_placed_children(pid)
 
+            self._persist()
+
+            # Delete the placed child immediately (idempotent)
+            self._delete_task(placed_child)
+
+            # If the group is finished, consider deleting the parent now.
             if not self.child_sorter.has_work():
-                self._delete_parent_if_done(pid)
+                self._delete_parent_if_ready(pid)
                 self.current_parent_id = None
                 self.child_sorter = None
 
-    def _persist(self):
-        """
-        Write a full, consistent snapshot:
-          - Roots = baseline roots + newly inserted roots (kept in self.roots_sorter.sorted)
-          - Children = union of:
-              a) preexisting child rows from the sheet (keyed by parent title)
-              b) newly placed children this session (keyed by parent id)
-        Status values are preserved by the writer.
-        """
-        # Build the children map including both 'by id' (new) and 'by title' (existing)
-        children_union: Dict[AnyType, List[Dict[str, Any]]] = {}
+    # ---- persistence & activation ----
 
-        # Include newly placed children by parent id
+    def _persist(self):
+        children_union: Dict[AnyType, List[Dict[str, Any]]] = {}
         for pid, lst in self.children_sorted_by_parent_id.items():
             children_union[pid] = list(lst)
-
-        # Include baseline children groups by parent **title**
         for ptitle, lst in self.baseline_children_by_title.items():
-            # If we also have newly placed children for the same parent, append them after existing:
-            # We'll find that parent's id by looking for a root with matching title.
             children_union.setdefault(ptitle, [])
             children_union[ptitle].extend(lst)
 
@@ -292,44 +379,30 @@ class RankingController:
             children_union
         )
 
-    # -- Child group orchestration --
-
     def _auto_place_trivial_children(self):
-        """
-        For any parent id with 0 children: attempt to delete the parent now (it is already ranked).
-        For any parent id with exactly 1 child remaining: place that child immediately, write, and delete it.
-        NOTE: This will cause the **first write** if any auto-placement occurs; otherwise we remain read-only.
-        """
-        wrote_any = False
+        """Auto-handle parents with 0 or 1 remaining child."""
         for pid in list(self.children_remaining_by_parent_id.keys()):
             rem = self.children_remaining_by_parent_id.get(pid, [])
             if len(rem) == 0:
-                self._delete_parent_if_done(pid)
+                self._delete_parent_if_ready(pid)
                 continue
             if len(rem) == 1:
                 child = rem.pop(0)
                 self.children_sorted_by_parent_id.setdefault(pid, []).append(child)
                 self._persist()
-                wrote_any = True
                 self._delete_task(child)
-                self._delete_parent_if_done(pid)
-        # If we auto-placed none, we still have not written anything yet (respecting "no rewrite on restart").
+                self._delete_parent_if_ready(pid)
 
     def _activate_next_parent_group(self) -> bool:
         while self.parent_order_ids:
             pid = self.parent_order_ids[0]
             rem = self.children_remaining_by_parent_id.get(pid, [])
             placed = self.children_sorted_by_parent_id.get(pid, [])
-            total = len(rem) + len(placed)
-            if total <= 1:
-                # trivial group handled elsewhere; advance + ensure deletion
-                if rem:
-                    # single child left -> auto place then delete
-                    child = rem.pop(0)
-                    self.children_sorted_by_parent_id.setdefault(pid, []).append(child)
-                    self._persist()
-                    self._delete_task(child)
-                self._delete_parent_if_done(pid)
+
+            total_to_process = len(rem)
+            # If nothing remains to process for this parent, possibly delete and advance
+            if total_to_process == 0:
+                self._delete_parent_if_ready(pid)
                 self.parent_order_ids.pop(0)
                 continue
 
@@ -342,7 +415,29 @@ class RankingController:
 
         return False
 
-    # -- Deletions --
+    # ---- deletions ----
+
+    def _parent_has_unprocessed_children(self, pid: str) -> bool:
+        if len(self.children_remaining_by_parent_id.get(pid, [])) > 0:
+            return True
+        # Also consider the active sorter for this parent
+        if self.current_parent_id == pid and self.child_sorter and self.child_sorter.has_work():
+            return True
+        return False
+
+    def _delete_parent_if_ready(self, pid: Optional[str]):
+        if not pid:
+            return
+        if self._parent_has_unprocessed_children(pid):
+            return
+        parent = next((r for r in self.roots_sorter.sorted if r.get("id") == pid), None)
+        if parent:
+            self._delete_task(parent)
+
+    def _final_cleanup_for_parents(self):
+        """Run at flush/exit: delete any parents with no remaining children to process."""
+        for pid in list(self.children_remaining_by_parent_id.keys()):
+            self._delete_parent_if_ready(pid)
 
     def _delete_task(self, task: Dict[str, Any]):
         tid = task.get("id")
@@ -354,29 +449,11 @@ class RankingController:
         try:
             self.gt.service.tasks().delete(tasklist=tlist, task=tid).execute()
         except Exception:
+            # Parent might already be gone (or children cascaded) — safe to ignore.
             pass
         self.deleted_ids.add(tid)
 
-    def _delete_newly_placed_children(self, pid: Optional[str]):
-        if not pid or not self.child_sorter:
-            return
-        for t in self.child_sorter.sorted:
-            tid = t.get("id")
-            if tid and tid not in self.deleted_ids:
-                self._delete_task(t)
-
-    def _delete_parent_if_done(self, pid: Optional[str]):
-        if not pid:
-            return
-        # Parent can be deleted after all its children are placed/cleared
-        any_remaining = self.children_remaining_by_parent_id.get(pid)
-        if any_remaining:
-            return
-        parent = next((r for r in self.roots_sorter.sorted if r.get("id") == pid), None)
-        if parent:
-            self._delete_task(parent)
-
-# --------- UI (unchanged behavior: minimal info + geometry persistence) ---------
+# --------- UI ---------
 
 class UIState:
     def __init__(self, path: str):
@@ -476,6 +553,10 @@ class RankerUI:
 
         def on_close():
             self._save_geometry()
+            try:
+                self.controller.flush()
+            except Exception:
+                pass
             self.root.destroy()
         self.root.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -554,7 +635,7 @@ def main():
     else:
         sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
 
-    # Always ensure the dropdown + colors exist; this is idempotent.
+    # Idempotent
     sheets.ensure_status_dropdown_and_colors(spreadsheet_id, sheet_tab)
 
     # 1) Read the existing sheet (NO WRITES HERE).
@@ -576,7 +657,7 @@ def main():
         children_from_gt_by_id=children_from_gt_by_id,
     )
 
-    # 4) Run the UI (still O(n log n) thanks to PairwiseBinarySorter).
+    # 4) Run the UI (pairwise O(n log n)).
     ui = RankerUI(controller, state_path=ui_state_path)
     ui.run()
 

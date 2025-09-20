@@ -2,11 +2,11 @@
 """
 Google Sheets helper for the Pairwise Ranker.
 
-Columns:
+Columns (updated):
   A: Status (dropdown: not started / in progress / done)  [with color rules]
   B: Rank        (only on root rows)
-  C: Parent Title   (blank for roots)
-  D: Title
+  C: Title
+  D: Parent Title   (blank for roots)
   E: Description
   F: Link
 
@@ -18,6 +18,9 @@ Key capabilities:
 - write_full_state(): rewrite the entire tab using the current in-memory state,
   **preserving Status values** by matching rows on (Parent Title, Title).
 - ensure_status_dropdown_and_colors(): installs the data validation + color rules.
+
+Additional behaviors:
+- If Description and Link are identical (trimmed), Description is written blank so only Link remains.
 """
 
 import os
@@ -31,7 +34,8 @@ from google.auth.transport.requests import Request
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-HEADER = ["Status", "Rank", "Parent Title", "Title", "Description", "Link"]
+# UPDATED HEADER ORDER: Title moved before Parent Title
+HEADER = ["Status", "Rank", "Title", "Parent Title", "Description", "Link"]
 STATUS_VALUES = ["not started", "in progress", "done"]
 
 # subtle readable backgrounds
@@ -210,7 +214,8 @@ class SheetsClient:
 
         current_parent_title: Optional[str] = None
         for i, row in enumerate(norm[1:], start=2):
-            status, rank, parent_title, title, desc, link = row
+            # A,B,C,D,E,F = Status, Rank, Title, Parent Title, Description, Link
+            status, rank, title, parent_title, desc, link = row
             title = (title or "").strip()
             parent_title = (parent_title or "").strip()
             if not title:
@@ -227,7 +232,7 @@ class SheetsClient:
                 roots.append(task_row)
                 current_parent_title = title
             else:
-                # child row: parent is explicit in col C; if blank, fall back to last seen root
+                # child row: parent is explicit in col D; if blank, fall back to last seen root
                 ptitle = parent_title or (current_parent_title or "")
                 if ptitle:
                     children_by_parent.setdefault(ptitle, []).append(task_row)
@@ -254,7 +259,8 @@ class SheetsClient:
             if i == 0:
                 continue  # header
             row = (row + [""] * 6)[:6]
-            status, _rank, parent_title, title, _desc, _link = row
+            # A,B,C,D,E,F = Status, Rank, Title, Parent Title, Description, Link
+            status, _rank, title, parent_title, _desc, _link = row
             key = ((parent_title or "").strip(), (title or "").strip())
             if key[1]:
                 m[key] = (status or "").strip()
@@ -280,12 +286,20 @@ class SheetsClient:
         """
         status_map = self._read_existing_status_map(spreadsheet_id, sheet_title)
 
+        def _dedupe_desc_link(desc: str, link: str) -> Tuple[str, str]:
+            d = (desc or "").strip()
+            l = (link or "").strip()
+            return ("" if d and l and d == l else d, l)
+
         def row_for(task: Dict[str, Any], rank_str: str, parent_title: str) -> List[str]:
             title = (task.get("title") or "").strip()
             desc  = (task.get("notes") or "").strip()
             link  = (task.get("_link") or "").strip()
-            status = status_map.get((parent_title or "", title), "")
-            return [status, rank_str, parent_title, title, desc, link]
+            # If Description and Link are the same, keep only the link
+            desc, link = _dedupe_desc_link(desc, link)
+            status = status_map.get(((parent_title or "").strip(), title), "")
+            # Order: Status, Rank, Title, Parent Title, Description, Link
+            return [status, rank_str, title, parent_title, desc, link]
 
         rows: List[List[str]] = [list(HEADER)]
 
