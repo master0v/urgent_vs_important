@@ -2,22 +2,24 @@
 """
 Google Sheets helper for the Pairwise Ranker.
 
-Columns (updated):
-  A: Status (dropdown: not started / in progress / done)
-  B: Rank        (only on root rows)
-  C: Category    (editable dropdown from a separate tab)
-  D: Title
-  E: Parent Title   (blank for roots)
-  F: Description
-  G: Link
+Strict canonical header (no Rank; Effort/Joy present between Description and Link):
+  A: Status
+  B: Category
+  C: Title
+  D: Parent Title
+  E: Description
+  F: Effort
+  G: Joy
+  H: Link
 
-Behaviors:
-- read_full_state(): parse the existing sheet into roots + children (with 'category' carried along).
-- write_full_state(): rewrite the entire tab; preserves Status and Category by matching (Parent Title, Title).
-- ensure_status_dropdown_and_colors(): installs status validation + color rules.
-- ensure_category_dropdown(): installs editable dropdown for Category from a configurable tab.
-- read_categories(): returns the Category list from the configured tab (first column A).
-- If Description and Link are identical, Description is written blank so only Link remains.
+Behavior:
+- On read: require exact header match. If incorrect, raise a clear ValueError and stop.
+- On write: always write the canonical 8-col header, then rows.
+- Safety merge: before writing, read the existing sheet and append any pre-existing rows
+  (keyed by (Parent Title, Title)) that are not in the new write set — so row count never decreases.
+  This happens only if the existing header is correct; otherwise we abort with an error.
+- Preserves Status, Category, Effort, Joy for existing (Parent Title, Title) when the app doesn't supply them.
+- If Description == Link, we blank Description to reduce clutter.
 """
 
 import os
@@ -31,14 +33,15 @@ from google.auth.transport.requests import Request
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# UPDATED HEADER ORDER: Category added after Rank; Title still before Parent Title.
-HEADER = ["Status", "Rank", "Category", "Title", "Parent Title", "Description", "Link"]
+HEADER = ["Status", "Category", "Title", "Parent Title", "Description", "Effort", "Joy", "Link"]
 STATUS_VALUES = ["not started", "in progress", "done"]
 
-# subtle readable backgrounds
 COLOR_RED    = {"red": 0.96, "green": 0.80, "blue": 0.80}
 COLOR_ORANGE = {"red": 1.00, "green": 0.90, "blue": 0.80}
 COLOR_GREEN  = {"red": 0.85, "green": 0.94, "blue": 0.83}
+
+def _s(x: Any) -> str:
+    return (x or "").strip()
 
 class SheetsClient:
     def __init__(self, credentials_dir: Optional[str] = None):
@@ -130,7 +133,7 @@ class SheetsClient:
         status_range = {
             "sheetId": sheet_id,
             "startRowIndex": 1,  # skip header
-            "startColumnIndex": 0,  # Status col A
+            "startColumnIndex": 0,  # Column A (Status)
             "endColumnIndex": 1
         }
 
@@ -148,7 +151,6 @@ class SheetsClient:
                     }
                 }
             },
-            # Conditional formats for each status
             self._cf_eq("not started", COLOR_RED, status_range, 0),
             self._cf_eq("in progress", COLOR_ORANGE, status_range, 1),
             self._cf_eq("done", COLOR_GREEN, status_range, 2),
@@ -160,17 +162,16 @@ class SheetsClient:
 
     def ensure_category_dropdown(self, spreadsheet_id: str, data_sheet_title: str, categories_tab: str):
         """
-        Install an editable dropdown for the Category column (col C) that points to 'categories_tab'!A:A.
-        The dropdown is not strict, so users can type new values too.
+        Editable dropdown for Category (Column B) referencing 'categories_tab'!A:A.
         """
         data_sheet_id = self._get_sheet_id(spreadsheet_id, data_sheet_title)
-        categories_sheet_id = self._get_sheet_id(spreadsheet_id, categories_tab)
+        _ = self._get_sheet_id(spreadsheet_id, categories_tab)  # ensure exists
 
         category_col_range = {
             "sheetId": data_sheet_id,
-            "startRowIndex": 1,     # skip header
-            "startColumnIndex": 2,  # Column C (Category)
-            "endColumnIndex": 3
+            "startRowIndex": 1,
+            "startColumnIndex": 1,  # Column B
+            "endColumnIndex": 2
         }
 
         requests = [
@@ -184,7 +185,7 @@ class SheetsClient:
                                 "userEnteredValue": f"='{categories_tab}'!A:A"
                             }]
                         },
-                        "strict": False,   # allow typing new categories
+                        "strict": False,
                         "showCustomUi": True
                     }
                 }
@@ -211,10 +212,27 @@ class SheetsClient:
 
     # ---------- reads & writes ----------
 
+    def _require_header_or_fail(self, spreadsheet_id: str, sheet_title: str) -> List[List[str]]:
+        """Fetch values and ensure header matches exactly; otherwise raise ValueError."""
+        resp = self.service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:H1"
+        ).execute()
+        row0 = (resp.get("values") or [[]])[0] if resp.get("values") else []
+        if row0 != HEADER:
+            found = ", ".join(row0) if row0 else "(none)"
+            expected = ", ".join(HEADER)
+            raise ValueError(
+                f"Unexpected header in sheet '{sheet_title}'.\n"
+                f"Expected: [{expected}]\nFound:    [{found}]\n\n"
+                f"Fix the header row exactly as above (A1..H1), or create a new tab and let the app write it."
+            )
+        # fetch full sheet once header validated
+        resp_full = self.service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_title}!A1:H1000000"
+        ).execute()
+        return resp_full.get("values", []) or []
+
     def read_categories(self, spreadsheet_id: str, categories_tab: str) -> List[str]:
-        """
-        Read categories from the given tab (first column A, ignoring header blanks).
-        """
         rng = f"{categories_tab}!A1:A1000"
         try:
             resp = self.service.spreadsheets().values().get(
@@ -238,82 +256,55 @@ class SheetsClient:
         sheet_title: str
     ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
         """
-        Parse the existing sheet (if any) into roots + children-by-parent (keyed by Parent Title).
-        Returns:
-          roots_in_order: list of dicts with keys: title, notes, _link, category
-          children_by_parent_title: { parent_title: [ {title, notes, _link, category}, ... ] }
+        Read the sheet strictly using the canonical header.
+        Root rows: blank 'Parent Title'.
         """
-        rng = f"{sheet_title}!A1:G1000000"
-        try:
-            resp = self.service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=rng
-            ).execute()
-        except Exception:
-            return [], {}
-
-        rows = resp.get("values", [])
+        rows = self._require_header_or_fail(spreadsheet_id, sheet_title)
         if not rows:
             return [], {}
 
-        # Normalize rows to 7 columns
-        norm = [(r + [""] * 7)[:7] for r in rows]
-        if norm[0][:len(HEADER)] != HEADER[:len(norm[0])]:
-            return [], {}
-
+        body = rows[1:]
         roots: List[Dict[str, Any]] = []
         children_by_parent: Dict[str, List[Dict[str, Any]]] = {}
 
-        current_parent_title: Optional[str] = None
-        for i, row in enumerate(norm[1:], start=2):
-            # A..G = Status, Rank, Category, Title, Parent Title, Description, Link
-            status, rank, category, title, parent_title, desc, link = row
-            title = (title or "").strip()
-            parent_title = (parent_title or "").strip()
+        for r in body:
+            r = (r + [""] * 8)[:8]
+            status, category, title, parent_title, desc, effort, joy, link = r
+            title = _s(title)
+            parent_title = _s(parent_title)
             if not title:
                 continue
 
-            task_row = {
+            task = {
                 "title": title,
                 "notes": desc or "",
-                "_link": link or "",
-                "category": (category or "").strip(),
+                "_link": _s(link),
+                "category": _s(category),
+                "effort": _s(effort),
+                "joy": _s(joy),
             }
 
-            if (rank or "").strip():  # root row (B has a value)
-                roots.append(task_row)
-                current_parent_title = title
+            if parent_title:
+                children_by_parent.setdefault(parent_title, []).append(task)
             else:
-                ptitle = parent_title or (current_parent_title or "")
-                if ptitle:
-                    children_by_parent.setdefault(ptitle, []).append(task_row)
+                roots.append(task)
 
         return roots, children_by_parent
 
-    def _read_existing_status_and_category_map(self, spreadsheet_id: str, sheet_title: str) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    def _read_existing_preserve_map(
+        self, spreadsheet_id: str, sheet_title: str
+    ) -> Dict[Tuple[str, str], Tuple[str, str, str, str]]:
         """
-        Mapping (Parent Title, Title) -> (Status, Category) for preserving on rewrite.
+        (Parent Title, Title) -> (Status, Category, Effort, Joy)
         """
-        rng = f"{sheet_title}!A1:G1000000"
-        try:
-            resp = self.service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=rng
-            ).execute()
-        except Exception:
-            return {}
-        rows = resp.get("values", [])
-        if not rows:
-            return {}
-
-        m: Dict[Tuple[str, str], Tuple[str, str]] = {}
-        for i, row in enumerate(rows):
-            if i == 0:
-                continue  # header
-            row = (row + [""] * 7)[:7]
-            # A..G = Status, Rank, Category, Title, Parent Title, Description, Link
-            status, _rank, category, title, parent_title, _desc, _link = row
-            key = ((parent_title or "").strip(), (title or "").strip())
+        rows = self._require_header_or_fail(spreadsheet_id, sheet_title)
+        m: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+        for r in rows[1:]:
+            r = (r + [""] * 8)[:8]
+            status, category, title, parent_title, _desc, effort, joy, _link = r
+            key = (_s(parent_title), _s(title))
             if key[1]:
-                m[key] = ((status or "").strip(), (category or "").strip())
+                m[key] = (_s(status), _s(category), _s(effort), _s(joy))
         return m
 
     def clear_values(self, spreadsheet_id: str, sheet_title: str):
@@ -329,50 +320,77 @@ class SheetsClient:
         children_by_parent: Dict[Any, List[Dict[str, Any]]],
     ):
         """
-        Rewrite the sheet with header + all rows, preserving Status & Category per (Parent Title, Title).
-        children_by_parent can be keyed by parent id (new session placements) **or** parent title (baseline).
+        Write canonical header + rows. Never reduce row count:
+        we merge in any existing rows not present in the new set (by (Parent Title, Title)).
+        If the existing header is wrong, we abort with a clear error (no write).
         """
-        sc_map = self._read_existing_status_and_category_map(spreadsheet_id, sheet_title)
+        # Validate header first (abort on mismatch)
+        existing_rows = self._require_header_or_fail(spreadsheet_id, sheet_title)
+
+        preserve_map = self._read_existing_preserve_map(spreadsheet_id, sheet_title)
 
         def _dedupe_desc_link(desc: str, link: str):
-            d = (desc or "").strip()
-            l = (link or "").strip()
+            d = _s(desc)
+            l = _s(link)
             return ("" if d and l and d == l else d, l)
 
-        def row_for(task: Dict[str, Any], rank_str: str, parent_title: str) -> List[str]:
-            title = (task.get("title") or "").strip()
-            desc  = (task.get("notes") or "").strip()
-            link  = (task.get("_link") or "").strip()
-            category = (task.get("category") or "").strip()
-            # If Description and Link are the same, keep only the link
+        def row_for(task: Dict[str, Any], parent_title: str) -> List[str]:
+            title    = _s(task.get("title"))
+            desc     = _s(task.get("notes"))
+            link     = _s(task.get("_link"))
+            category = _s(task.get("category"))
+            effort   = _s(task.get("effort"))
+            joy      = _s(task.get("joy"))
+
             desc, link = _dedupe_desc_link(desc, link)
-            # preserve Status & Category if missing from task dict
-            prev_status, prev_cat = sc_map.get(((parent_title or "").strip(), title), ("", ""))
+
+            prev_status, prev_cat, prev_eff, prev_joy = preserve_map.get(
+                (_s(parent_title), title), ("", "", "", "")
+            )
             status = prev_status
-            if not category:
-                category = prev_cat
-            # Order: Status, Rank, Category, Title, Parent Title, Description, Link
-            return [status, rank_str, category, title, parent_title, desc, link]
+            if not category: category = prev_cat
+            if not effort:   effort   = prev_eff
+            if not joy:      joy      = prev_joy
+
+            return [status, category, title, parent_title, desc, effort, joy, link]
 
         rows: List[List[str]] = [list(HEADER)]
 
-        by_id_or_title = {}
-        for k, lst in (children_by_parent or {}).items():
-            by_id_or_title[k] = lst
+        by_id_or_title = dict(children_by_parent or {})
 
-        for idx, root in enumerate(roots_in_order, start=1):
-            root_title = (root.get("title") or "").strip()
-            rows.append(row_for(root, str(idx), ""))
+        for root in (roots_in_order or []):
+            root_title = _s(root.get("title"))
+            if not root_title:
+                continue
+            rows.append(row_for(root, ""))
 
             pid = root.get("id")
-            child_list = None
-            if pid is not None and pid in by_id_or_title:
-                child_list = by_id_or_title.get(pid, [])
+            child_list = by_id_or_title.get(pid) if pid is not None else None
             if not child_list:
                 child_list = by_id_or_title.get(root_title, [])
-
             for ch in (child_list or []):
-                rows.append(row_for(ch, "", root_title))
+                rows.append(row_for(ch, root_title))
+
+        # SAFETY MERGE (with strict header)
+        existing_body = existing_rows[1:] if len(existing_rows) > 1 else []
+        existing_rows_by_key = {}
+        for r in existing_body:
+            r = (r + [""] * 8)[:8]
+            _status, _cat, title, parent_title, _desc, _eff, _joy, _lnk = r
+            key = (_s(parent_title), _s(title))
+            if key[1]:
+                existing_rows_by_key[key] = r
+
+        new_keys = set()
+        for r in rows[1:]:
+            _status, _cat, title, parent_title, _desc, _eff, _joy, _lnk = (r + [""] * 8)[:8]
+            key = (_s(parent_title), _s(title))
+            if key[1]:
+                new_keys.add(key)
+
+        missing = [v for k, v in existing_rows_by_key.items() if k not in new_keys]
+        if missing:
+            rows.extend(missing)
 
         # Final write
         self.clear_values(spreadsheet_id, sheet_title)

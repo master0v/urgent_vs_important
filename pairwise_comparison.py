@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-Pairwise ranker (Tkinter) — editable Description + Category field.
+Pairwise ranker (Tkinter) — now with inline Effort/Joy row.
 
-New:
-- Description text box is editable in-app (changes are saved when you click Left/Right).
-- A 'Category' field (editable dropdown via ttk.Combobox) sits above Description.
-  Values come from a configurable tab (default 'Categories'). They’re also written to the sheet
-  in the new 'Category' column (after Rank).
-- Sheet-side: data validation for Category is set up to reference '<categories_tab>'!A:A.
-
-Existing:
-- Robust restart (reconcile sheet rows with GT by Title).
-- Children deleted immediately after writing; parents deleted when no unprocessed children remain
-  (or immediately if DELETE_PARENTS_IMMEDIATELY=True).
+Changes:
+- Effort/Joy line is: "Effort (hours): [entry]    Joy (1-5): [entry]" on a single row.
+  The two entry fields share the available width equally.
+- Link is editable and saved.
+- Remaining label shows "Remaining <N> tasks in '<list name>'".
+- No Rank column (row order in the Sheet represents rank).
 """
 
 import json
@@ -27,7 +22,7 @@ from tasks_api import GoogleTasks, SEPARATOR_TITLE
 from sheets_api import SheetsClient
 
 # ---- behavior switches ----
-DELETE_PARENTS_IMMEDIATELY = False  # set True if you want parents removed immediately after they’re placed
+DELETE_PARENTS_IMMEDIATELY = False
 
 # --------- Config ---------
 
@@ -245,13 +240,6 @@ class RankingController:
             if pid and pid not in self.children_remaining_by_parent_id:
                 self.children_remaining_by_parent_id[pid] = []
 
-    # ---- metadata updates from UI ----
-
-    def apply_edits(self, task: Dict[str, Any], notes: str, category: str):
-        """Apply UI edits to the task (mutates in-memory dict)."""
-        task["notes"] = (notes or "").strip()
-        task["category"] = (category or "").strip()
-
     # ---- UI-facing API ----
 
     def remaining_count(self) -> int:
@@ -278,17 +266,10 @@ class RankingController:
         return self.child_sorter.current_pair()
 
     def choose_left(self, left_task: Dict[str, Any], right_task: Dict[str, Any]):
-        self._apply_pending_edits(left_task, right_task)
         self._decide(True)
 
     def choose_right(self, left_task: Dict[str, Any], right_task: Dict[str, Any]):
-        self._apply_pending_edits(left_task, right_task)
         self._decide(False)
-
-    def _apply_pending_edits(self, left_task: Dict[str, Any], right_task: Dict[str, Any]):
-        # No-op placeholder; edits are already applied via UI before calling decide.
-        # (Kept in case we want extra hooks later.)
-        pass
 
     def flush(self):
         self._persist()
@@ -439,14 +420,31 @@ class TaskPane:
         tk.Label(cat_row, text="Category:", anchor="w").pack(side="left")
         self.category_combo = ttk.Combobox(cat_row, values=category_values)
         self.category_combo.pack(side="left", fill="x", expand=True)
-        # Editable: allow free typing
-        self.category_combo.configure(state="normal")
+        self.category_combo.configure(state="normal")  # allow typing
 
         tk.Label(self.frame, text="Description:", anchor="w").pack(fill="x", padx=10)
         self.desc = tk.Text(self.frame, height=12, wrap="word")
-        self.desc.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        # Editable by design (no 'disabled' state)
+        self.desc.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
+        # Effort/Joy row — labels inline with entries on ONE line
+        ej_row = tk.Frame(self.frame)
+        ej_row.pack(fill="x", padx=10, pady=(0, 10))
+        # 4 columns: Effort label, Effort entry, Joy label, Joy entry
+        for col in range(4):
+            ej_row.grid_columnconfigure(col, weight=0)
+        # Give equal width to the two entries (cols 1 and 3)
+        ej_row.grid_columnconfigure(1, weight=1, uniform="ej")
+        ej_row.grid_columnconfigure(3, weight=1, uniform="ej")
+
+        tk.Label(ej_row, text="Effort (hours)", anchor="w").grid(row=0, column=0, sticky="w", padx=(0,6))
+        self.effort_val = tk.Entry(ej_row)
+        self.effort_val.grid(row=0, column=1, sticky="ew", padx=(0,12))
+
+        tk.Label(ej_row, text="Joy (1-5)", anchor="w").grid(row=0, column=2, sticky="w", padx=(0,6))
+        self.joy_val = tk.Entry(ej_row)
+        self.joy_val.grid(row=0, column=3, sticky="ew")
+
+        # Parent (readonly)
         self.parent_row = tk.Frame(self.frame)
         self.parent_row.pack(fill="x", padx=10, pady=(0, 4))
         tk.Label(self.parent_row, text="Parent:", anchor="w").pack(side="left")
@@ -454,23 +452,25 @@ class TaskPane:
         self.parent_val.pack(side="left", fill="x", expand=True)
         self.parent_val.configure(state="readonly")
 
+        # Link (EDITABLE)
         link_row = tk.Frame(self.frame)
         link_row.pack(fill="x", padx=10, pady=(0, 10))
         tk.Label(link_row, text="Link:", anchor="w").pack(side="left")
-        self.link_val = tk.Entry(link_row)
+        self.link_val = tk.Entry(link_row)  # editable
         self.link_val.pack(side="left", fill="x", expand=True)
-        self.link_val.configure(state="readonly")
 
-        self._task_ref = None  # bind the dict we’re displaying so we can apply edits
+        self._task_ref = None  # bound task dict
 
     def set_task(self, t: Optional[Dict[str, Any]]):
         self._task_ref = t
         if not t:
             self.title_btn.config(text="(no task)", state="disabled")
             self._set_desc("")
-            self._set_entry(self.parent_val, "")
+            self._set_ro_entry(self.parent_val, "")
             self._set_entry(self.link_val, "")
             self.category_combo.set("")
+            self._set_entry(self.effort_val, "")
+            self._set_entry(self.joy_val, "")
             self.parent_row.forget()
             return
 
@@ -481,11 +481,13 @@ class TaskPane:
         parent_title = (t.get("_parent_title") or "").strip()
         if parent_title:
             self.parent_row.pack(fill="x", padx=10, pady=(0, 4))
-            self._set_entry(self.parent_val, parent_title)
+            self._set_ro_entry(self.parent_val, parent_title)
         else:
             self.parent_row.forget()
 
         self._set_entry(self.link_val, (t.get("_link") or "").strip())
+        self._set_entry(self.effort_val, (t.get("effort") or "").strip())
+        self._set_entry(self.joy_val, (t.get("joy") or "").strip())
 
     def apply_edits_to_task(self):
         """Push current UI values into the bound task dict (if any)."""
@@ -493,23 +495,52 @@ class TaskPane:
             return
         notes = self.desc.get("1.0", "end").strip()
         category = self.category_combo.get().strip()
+        link = self.link_val.get().strip()
+        effort = self.effort_val.get().strip()
+        joy = self.joy_val.get().strip()
         self._task_ref["notes"] = notes
         self._task_ref["category"] = category
+        self._task_ref["_link"] = link
+        self._task_ref["effort"] = effort
+        self._task_ref["joy"] = joy
 
     def _set_desc(self, text: str):
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", text)
 
     def _set_entry(self, ent: tk.Entry, value: str):
+        ent.delete(0, "end")
+        ent.insert(0, value)
+
+    def _set_ro_entry(self, ent: tk.Entry, value: str):
         ent.configure(state="normal")
         ent.delete(0, "end")
         ent.insert(0, value)
         ent.configure(state="readonly")
 
+class UIStatePersist:
+    def __init__(self, path: str):
+        self.path = path
+        self.geometry = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    self.geometry = (json.load(f) or {}).get("geometry")
+            except Exception:
+                self.geometry = None
+
+    def save(self, geometry: str):
+        try:
+            with open(self.path, "w") as f:
+                json.dump({"geometry": geometry}, f)
+        except Exception:
+            pass
+
 class RankerUI:
-    def __init__(self, controller: RankingController, state_path: str, category_values: List[str]):
+    def __init__(self, controller, state_path: str, category_values: List[str], list_name: Optional[str] = None):
         self.controller = controller
-        self.state = UIState(state_path)
+        self.state = UIStatePersist(state_path)
+        self.list_name = list_name or "All tasks"
 
         self.root = tk.Tk()
         self.root.title("Pairwise Task Ranker")
@@ -527,7 +558,6 @@ class RankerUI:
         def on_close():
             self._save_geometry()
             try:
-                # Make sure pending edits are applied before final flush
                 self.left.apply_edits_to_task()
                 self.right.apply_edits_to_task()
                 self.controller.flush()
@@ -554,7 +584,7 @@ class RankerUI:
         mid.grid_columnconfigure(1, weight=1, uniform="col")
         mid.grid_rowconfigure(0, weight=1)
 
-        self.remaining = tk.Label(self.root, text="Remaining 0", font=("Arial", 12))
+        self.remaining = tk.Label(self.root, text=f"Remaining 0 tasks in '{self.list_name}'", font=("Arial", 12))
         self.remaining.pack(fill="x", padx=12, pady=(6, 12))
 
         self.root.bind("<Left>",  lambda e: self._pick_left())
@@ -575,17 +605,16 @@ class RankerUI:
         if not pair:
             self.left.set_task(None)
             self.right.set_task(None)
-            self.remaining.config(text="Remaining 0")
+            self.remaining.config(text=f"Remaining 0 tasks in '{self.list_name}'")
             self.root.after(600, self.root.destroy)
             return
         a, b = pair
         self.left.set_task(a)
         self.right.set_task(b)
-        self.remaining.config(text=f"Remaining {self.controller.remaining_count()}")
+        self.remaining.config(text=f"Remaining {self.controller.remaining_count()} tasks in '{self.list_name}'")
 
     def _pick_left(self):
         if self._current_pair:
-            # Apply edits from both panes before deciding
             self.left.apply_edits_to_task()
             self.right.apply_edits_to_task()
             a, b = self._current_pair
@@ -619,12 +648,18 @@ def main():
     if not spreadsheet_id:
         spreadsheet_id = sheets.create_spreadsheet(sheet_title)
         sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
-        # Ensure categories tab also exists if creating a new sheet
         sheets.ensure_tab(spreadsheet_id, categories_tab)
         print(f"[Created spreadsheet] ID: {spreadsheet_id} • Tab: {sheet_tab}")
+        # Prime header immediately on brand-new tab so header check passes later
+        sheets.clear_values(spreadsheet_id, sheet_tab)
+        sheets.service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_tab}!A1",
+            valueInputOption="RAW",
+            body={"values": [list(HEADER)]},
+        ).execute()
     else:
         sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
-        # Do not force-create categories tab if user manages it elsewhere, but it's okay to ensure it exists
         sheets.ensure_tab(spreadsheet_id, categories_tab)
 
     # Install validations (idempotent)
@@ -634,14 +669,13 @@ def main():
     # Load categories for UI
     category_values = sheets.read_categories(spreadsheet_id, categories_tab)
 
-    # 1) Read the existing sheet (NO WRITES HERE).
+    # Strictly read existing sheet (will error out if header doesn't match)
     roots_from_sheet, children_from_sheet_by_title = sheets.read_full_state(spreadsheet_id, sheet_tab)
 
-    # 2) Fetch current Google Tasks snapshot (new items to inject).
+    # Fetch current Google Tasks snapshot
     gt = GoogleTasks()
     roots_from_gt, children_from_gt_by_id, _by_id = fetch_active_tasks(task_list_name)
 
-    # 3) Build controller.
     controller = RankingController(
         gt=gt,
         sheets=sheets,
@@ -653,8 +687,7 @@ def main():
         children_from_gt_by_id=children_from_gt_by_id,
     )
 
-    # 4) Run the UI.
-    ui = RankerUI(controller, state_path=ui_state_path, category_values=category_values)
+    ui = RankerUI(controller, state_path=ui_state_path, category_values=category_values, list_name=task_list_name or "All tasks")
     ui.run()
 
 if __name__ == "__main__":
