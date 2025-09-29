@@ -2,7 +2,7 @@
 """
 Google Sheets helper for the Pairwise Ranker.
 
-Strict canonical header (no Rank; Effort/Joy present between Description and Link):
+Canonical header (no Rank):
   A: Status
   B: Category
   C: Title
@@ -13,13 +13,22 @@ Strict canonical header (no Rank; Effort/Joy present between Description and Lin
   H: Link
 
 Behavior:
-- On read: require exact header match. If incorrect, raise a clear ValueError and stop.
-- On write: always write the canonical 8-col header, then rows.
-- Safety merge: before writing, read the existing sheet and append any pre-existing rows
-  (keyed by (Parent Title, Title)) that are not in the new write set — so row count never decreases.
-  This happens only if the existing header is correct; otherwise we abort with an error.
-- Preserves Status, Category, Effort, Joy for existing (Parent Title, Title) when the app doesn't supply them.
+- Strict header check (raises on mismatch).
+- On write: always write the canonical 8-col header, then rows derived from the current state.
+- Preserve Status, Category, Effort, Joy for existing (Parent Title, Title) keys when the app
+  doesn't supply them (so edits aren't lost).
 - If Description == Link, we blank Description to reduce clutter.
+- Subtask Title cells are prefixed with two spaces for visual indent.
+- Category data validation pulls choices from the 'Categories' tab and mirrors each category's
+  background color via conditional formatting.
+
+2025-09 updates (fix “subtasks vanished / gathered at bottom”):
+- Writes are still authoritative, BUT:
+  • For parents whose subtask ranking is NOT finalized (i.e., no child list passed in),
+    we *reuse the existing child rows from the sheet* (same order) and place them under
+    their parent. So child rows never disappear mid-ranking.
+  • For parents whose child ranking IS finalized, we write exactly the finalized list.
+- Safety check: refuse the write if a non-finalized parent would lose child rows.
 """
 
 import os
@@ -163,6 +172,7 @@ class SheetsClient:
     def ensure_category_dropdown(self, spreadsheet_id: str, data_sheet_title: str, categories_tab: str):
         """
         Editable dropdown for Category (Column B) referencing 'categories_tab'!A:A.
+        Also mirrors background colors from the 'Categories' tab via conditional formatting.
         """
         data_sheet_id = self._get_sheet_id(spreadsheet_id, data_sheet_title)
         _ = self._get_sheet_id(spreadsheet_id, categories_tab)  # ensure exists
@@ -191,6 +201,36 @@ class SheetsClient:
                 }
             }
         ]
+
+        # Read category values + colors from the Categories tab (first 1000 rows of col A)
+        meta = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            includeGridData=True,
+            ranges=[f"{categories_tab}!A1:A1000"]
+        ).execute()
+
+        cat_values_with_colors: List[Tuple[str, Dict[str, float]]] = []
+        try:
+            sheets = meta.get("sheets", [])
+            if sheets:
+                data = sheets[0].get("data", [])
+                if data and data[0].get("rowData"):
+                    for row in data[0]["rowData"]:
+                        cell = (row.get("values") or [{}])[0]
+                        val = (cell.get("userEnteredValue") or {}).get("stringValue", "")
+                        if val and val.strip():
+                            fmt = (cell.get("userEnteredFormat") or {})
+                            color = fmt.get("backgroundColor") or {}
+                            cat_values_with_colors.append((val.strip(), color))
+        except Exception:
+            pass
+
+        # Add a CF rule per category value that has a background color
+        cf_index = 0
+        for cat, color in cat_values_with_colors:
+            if color:
+                requests.append(self._cf_eq(cat, color, category_col_range, cf_index))
+                cf_index += 1
 
         self.service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id, body={"requests": requests}
@@ -320,14 +360,27 @@ class SheetsClient:
         children_by_parent: Dict[Any, List[Dict[str, Any]]],
     ):
         """
-        Write canonical header + rows. Never reduce row count:
-        we merge in any existing rows not present in the new set (by (Parent Title, Title)).
-        If the existing header is wrong, we abort with a clear error (no write).
-        """
-        # Validate header first (abort on mismatch)
-        existing_rows = self._require_header_or_fail(spreadsheet_id, sheet_title)
+        Write canonical header + rows.
 
+        Ordering:
+        - Each root row is written in order.
+        - Immediately after each root, its subtasks (if any) are written in the provided order.
+          Children can be mapped by parent id or by parent title; both lists are merged
+          and de-duplicated by normalized title.
+
+        Preservation:
+        - For any row we DO write, we reuse previous Status/Category/Effort/Joy if the new row leaves
+          those blank (so in-sheet edits survive).
+        - For parents whose child ranking is NOT finalized (no child list passed in),
+          we preserve their existing child rows from the sheet (under the parent).
+        - SAFETY: we refuse to write if preserving would still reduce a non-finalized parent's child count.
+        """
+        # Validate header & capture existing state
+        _ = self._require_header_or_fail(spreadsheet_id, sheet_title)
         preserve_map = self._read_existing_preserve_map(spreadsheet_id, sheet_title)
+        existing_roots, existing_children_by_parent_title = self.read_full_state(spreadsheet_id, sheet_title)
+
+        existing_parent_titles = {(_s(r.get("title"))) for r in existing_roots}
 
         def _dedupe_desc_link(desc: str, link: str):
             d = _s(desc)
@@ -335,7 +388,8 @@ class SheetsClient:
             return ("" if d and l and d == l else d, l)
 
         def row_for(task: Dict[str, Any], parent_title: str) -> List[str]:
-            title    = _s(task.get("title"))
+            raw_title = _s(task.get("title"))
+            title    = ("  " + raw_title) if parent_title else raw_title  # indent subtasks
             desc     = _s(task.get("notes"))
             link     = _s(task.get("_link"))
             category = _s(task.get("category"))
@@ -345,7 +399,7 @@ class SheetsClient:
             desc, link = _dedupe_desc_link(desc, link)
 
             prev_status, prev_cat, prev_eff, prev_joy = preserve_map.get(
-                (_s(parent_title), title), ("", "", "", "")
+                (_s(parent_title), raw_title), ("", "", "", "")
             )
             status = prev_status
             if not category: category = prev_cat
@@ -355,44 +409,63 @@ class SheetsClient:
             return [status, category, title, parent_title, desc, effort, joy, link]
 
         rows: List[List[str]] = [list(HEADER)]
+        by_key = dict(children_by_parent or {})
 
-        by_id_or_title = dict(children_by_parent or {})
-
+        # Build rows root-by-root and attach children
         for root in (roots_in_order or []):
             root_title = _s(root.get("title"))
             if not root_title:
                 continue
             rows.append(row_for(root, ""))
 
+            # Merge children passed in by parent id / parent title
+            merged_children: List[Dict[str, Any]] = []
             pid = root.get("id")
-            child_list = by_id_or_title.get(pid) if pid is not None else None
-            if not child_list:
-                child_list = by_id_or_title.get(root_title, [])
-            for ch in (child_list or []):
+            if pid is not None and pid in by_key:
+                merged_children.extend(by_key.get(pid) or [])
+            if root_title in by_key:
+                merged_children.extend(by_key.get(root_title) or [])
+
+            # Is this parent's child ranking finalized? (child list explicitly provided)
+            finalized = (pid in by_key) or (root_title in by_key)
+
+            # Deduplicate the provided children by normalized title
+            seen = set()
+            deduped_children: List[Dict[str, Any]] = []
+            for ch in merged_children:
+                t = _s(ch.get("title"))
+                nt = " ".join(t.split()).lower()
+                if not nt or nt in seen:
+                    continue
+                seen.add(nt)
+                deduped_children.append(ch)
+
+            # If NOT finalized, preserve existing children under this parent (don’t lose rows)
+            if not finalized:
+                existing_children = existing_children_by_parent_title.get(root_title, [])
+                for ch in existing_children:
+                    t = _s(ch.get("title"))
+                    nt = " ".join(t.split()).lower()
+                    if not nt or nt in seen:
+                        continue
+                    seen.add(nt)
+                    deduped_children.append(ch)
+
+                # Safety check: for a non-finalized parent that exists in the sheet,
+                # we must not reduce its child count.
+                if root_title in existing_children_by_parent_title:
+                    if len(deduped_children) < len(existing_children_by_parent_title[root_title]):
+                        raise RuntimeError(
+                            f"Refusing to write: detected potential loss of subtasks for parent '{root_title}'. "
+                            f"Existing: {len(existing_children_by_parent_title[root_title])}, "
+                            f"New: {len(deduped_children)}."
+                        )
+
+            # Emit children (if any)
+            for ch in deduped_children:
                 rows.append(row_for(ch, root_title))
 
-        # SAFETY MERGE (with strict header)
-        existing_body = existing_rows[1:] if len(existing_rows) > 1 else []
-        existing_rows_by_key = {}
-        for r in existing_body:
-            r = (r + [""] * 8)[:8]
-            _status, _cat, title, parent_title, _desc, _eff, _joy, _lnk = r
-            key = (_s(parent_title), _s(title))
-            if key[1]:
-                existing_rows_by_key[key] = r
-
-        new_keys = set()
-        for r in rows[1:]:
-            _status, _cat, title, parent_title, _desc, _eff, _joy, _lnk = (r + [""] * 8)[:8]
-            key = (_s(parent_title), _s(title))
-            if key[1]:
-                new_keys.add(key)
-
-        missing = [v for k, v in existing_rows_by_key.items() if k not in new_keys]
-        if missing:
-            rows.extend(missing)
-
-        # Final write
+        # Authoritative write (no global “append leftovers” needed; children preserved per parent)
         self.clear_values(spreadsheet_id, sheet_title)
         self.service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
