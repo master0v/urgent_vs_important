@@ -557,8 +557,7 @@ class TaskPane:
 
         parent_title = (t.get("_parent_title") or "").strip()
         base_title = (t.get("title") or "").strip()
-        display_title = f"{base_title} — subtask of {parent_title}" if parent_title else base_title
-        self.title_btn.config(text=display_title, state="normal")
+        self.title_btn.config(text=base_title, state="normal")
 
         self._set_desc((t.get("notes") or "").strip())
         self.category_combo.set((t.get("category") or "").strip())
@@ -682,11 +681,20 @@ class RankerUI:
 
     def _update_question_label(self):
         if self.controller.is_ranking_subtasks():
-            txt = "Which of the following two subtasks is more important for you?"
+            # Look up the current parent title
+            parent_id = self.controller.current_parent_id
+            parent_task = None
+            if parent_id:
+                parent_task = next((r for r in self.controller.roots_sorter.sorted if r.get("id") == parent_id), None)
+            parent_title = (parent_task.get("title") or "") if parent_task else ""
+            if parent_title:
+                txt = f"Which of the following two subtasks of '{parent_title}' is more important for you?"
+            else:
+                txt = "Which of the following two subtasks is more important for you?"
         else:
             txt = "Which of the following two tasks is more important for you?"
         self.question.config(text=txt)
-
+    
     def _refresh(self):
         # Fetch next pair first (this may activate child ranking), then update wording.
         pair = self.controller.current_pair()
