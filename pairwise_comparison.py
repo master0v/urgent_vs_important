@@ -376,14 +376,32 @@ class RankingController:
         """
         Write current state to the sheet:
           - Roots (always in current order).
-          - Subtasks ONLY for parents whose ranking is FINISHED (children_sorted_by_parent_id).
-        No pending subtasks are written here; sheets_api preserves existing children for unfinished parents.
+          - Subtasks:
+              * For parents whose ranking is FINISHED: use finalized order.
+              * For all other parents: preserve the children that already exist in the sheet.
         """
-        children_union: Dict[AnyType, List[Dict[str, Any]]] = {}
 
+        def _parent_key_for_children(parent_task: Dict[str, Any]) -> Any:
+            # Prefer stable ID; fall back to title for sheet-only parents with no GT id.
+            return parent_task.get("id") or (parent_task.get("title") or "")
+
+        # 1) Seed with baseline children from the sheet for *every* root
+        children_union: Dict[Any, List[Dict[str, Any]]] = {}
+        for r in self.roots_sorter.sorted:
+            key = _parent_key_for_children(r)
+            if not key:
+                continue
+            base_title = (r.get("title") or "")
+            base_children = self.baseline_children_by_title.get(base_title, [])
+            if base_children:
+                # copy to avoid aliasing
+                children_union[key] = list(base_children)
+
+        # 2) Override with any parents that are fully finalized
         for pid, lst in self.children_sorted_by_parent_id.items():
             children_union[pid] = list(lst)
 
+        # 3) Authoritatively write:
         self.sheets.write_full_state(
             self.spreadsheet_id,
             self.sheet_tab,
@@ -782,6 +800,16 @@ def main():
     # Fetch Google Tasks
     gt = GoogleTasks()
     roots_from_gt, children_from_gt_by_id, _by_id = fetch_active_tasks(task_list_name)
+    
+    sheet_task_count = len(roots_from_sheet) + sum(len(v) for v in children_from_sheet_by_title.values())
+    gt_task_count = len(roots_from_gt) + sum(len(v) for v in children_from_gt_by_id.values())
+
+    print(
+        f"\n============================================================================\n"
+        f"Loaded {sheet_task_count} tasks from the spreadsheet tab '{sheet_tab}'.  \n"
+        f"Will merge {gt_task_count} tasks from gTasks list '{task_list_name or 'All tasks'}'.\n"
+        f"============================================================================\n\n"
+    )
 
     controller = RankingController(
         gt=gt,
