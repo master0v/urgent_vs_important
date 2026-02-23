@@ -390,9 +390,9 @@ class RankingController:
         effort = (task.get("effort") or "").strip()
         joy = (task.get("joy") or "").strip()
 
-        status = ""
+        status = "Not Started"
         if ft:
-            status = ft.get("status") or ""
+            status = ft.get("status") or "Not Started"
             if not category: category = ft.get("category") or ""
             if not effort: effort = ft.get("effort") or ""
             if not joy: joy = ft.get("joy") or ""
@@ -586,6 +586,9 @@ class TaskPane:
         c_joy = headers[6] if headers and len(headers) > 6 else "Joy"
         c_link = headers[7] if headers and len(headers) > 7 else "Link"
         c_parent = headers[3] if headers and len(headers) > 3 else "Parent Title"
+        
+        effort_options = ["10m", "20m", "30m", "45m", "1h", "1.5h", "2h", "2.5h", "3h", "3.5h", "4h", "5h", "6h", "8h"]
+        joy_options = ["0", "1", "2", "3", "4", "5"]
 
         # Category row (editable dropdown)
         cat_row = tk.Frame(self.frame)
@@ -608,11 +611,11 @@ class TaskPane:
         ej_row.grid_columnconfigure(3, weight=1, uniform="ej")
 
         tk.Label(ej_row, text=c_eff, anchor="w").grid(row=0, column=0, sticky="w", padx=(0,6))
-        self.effort_val = tk.Entry(ej_row)
+        self.effort_val = ttk.Combobox(ej_row, values=effort_options)
         self.effort_val.grid(row=0, column=1, sticky="ew", padx=(0,12))
 
         tk.Label(ej_row, text=c_joy, anchor="w").grid(row=0, column=2, sticky="w", padx=(0,6))
-        self.joy_val = tk.Entry(ej_row)
+        self.joy_val = ttk.Combobox(ej_row, values=joy_options)
         self.joy_val.grid(row=0, column=3, sticky="ew")
 
         # Parent (readonly)
@@ -659,30 +662,50 @@ class TaskPane:
             self.parent_row.forget()
 
         self._set_entry(self.link_val, (t.get("_link") or "").strip())
-        self._set_entry(self.effort_val, (t.get("effort") or "").strip())
+        
+        effort = (t.get("effort") or "").strip()
+        if not effort:
+            effort = "1h"
+        else:
+            rev_map = {"0.2": "10m", "0.4": "20m", "0.5": "30m", "0.7": "45m", "1": "1h", "1.5": "1.5h", "2": "2h", "2.5": "2.5h", "3": "3h", "3.5": "3.5h", "4": "4h", "5": "5h", "6": "6h", "8": "8h"}
+            effort = rev_map.get(effort, effort)
+            
+        self._set_entry(self.effort_val, effort)
         self._set_entry(self.joy_val, (t.get("joy") or "").strip())
 
     def apply_edits_to_task(self):
         if not self._task_ref:
-            return
+            return False
+            
+        changed = False
         notes = self.desc.get("1.0", "end").strip()
         category = self.category_combo.get().strip()
         link = self.link_val.get().strip()
+        
         effort = self.effort_val.get().strip()
+        eff_map = {"10m": "0.2", "20m": "0.4", "30m": "0.5", "45m": "0.7", "1h": "1", "1.5h": "1.5", "2h": "2", "2.5h": "2.5", "3h": "3", "3.5h": "3.5", "4h": "4", "5h": "5", "6h": "6", "8h": "8"}
+        effort = eff_map.get(effort, effort)
+        
         joy = self.joy_val.get().strip()
-        self._task_ref["notes"] = notes
-        self._task_ref["category"] = category
-        self._task_ref["_link"] = link
-        self._task_ref["effort"] = effort
-        self._task_ref["joy"] = joy
+        
+        if self._task_ref.get("notes", "") != notes: changed = True; self._task_ref["notes"] = notes
+        if self._task_ref.get("category", "") != category: changed = True; self._task_ref["category"] = category
+        if self._task_ref.get("_link", "") != link: changed = True; self._task_ref["_link"] = link
+        if self._task_ref.get("effort", "") != effort: changed = True; self._task_ref["effort"] = effort
+        if self._task_ref.get("joy", "") != joy: changed = True; self._task_ref["joy"] = joy
+        
+        return changed
 
     def _set_desc(self, text: str):
         self.desc.delete("1.0", "end")
         self.desc.insert("1.0", text)
 
-    def _set_entry(self, ent: tk.Entry, value: str):
-        ent.delete(0, "end")
-        ent.insert(0, value)
+    def _set_entry(self, ent, value: str):
+        if hasattr(ent, 'set'):
+            ent.set(value)
+        else:
+            ent.delete(0, "end")
+            ent.insert(0, value)
 
     def _set_ro_entry(self, ent: tk.Entry, value: str):
         ent.configure(state="normal")
@@ -805,21 +828,25 @@ class RankerUI:
 
     def _pick_left(self):
         if self._current_pair:
-            self.left.apply_edits_to_task()
-            self.right.apply_edits_to_task()
+            changed_a = self.left.apply_edits_to_task()
+            changed_b = self.right.apply_edits_to_task()
             a, b = self._current_pair
-            self.controller.update_task_if_exists(a)
-            self.controller.update_task_if_exists(b)
+            if changed_a:
+                self.controller.update_task_if_exists(a)
+            if changed_b:
+                self.controller.update_task_if_exists(b)
             self.controller.choose_left(a, b)
         self._refresh()
 
     def _pick_right(self):
         if self._current_pair:
-            self.left.apply_edits_to_task()
-            self.right.apply_edits_to_task()
+            changed_a = self.left.apply_edits_to_task()
+            changed_b = self.right.apply_edits_to_task()
             a, b = self._current_pair
-            self.controller.update_task_if_exists(a)
-            self.controller.update_task_if_exists(b)
+            if changed_a:
+                self.controller.update_task_if_exists(a)
+            if changed_b:
+                self.controller.update_task_if_exists(b)
             self.controller.choose_right(a, b)
         self._refresh()
 
