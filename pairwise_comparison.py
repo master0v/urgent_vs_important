@@ -291,9 +291,9 @@ class RankingController:
             if pair is not None:
                 return pair
 
-        # 2) Ensure placed roots are persisted (handles single-root auto-place)
+        # 2) auto-handle trivial children
         if not self._persisted_after_auto_root and self.roots_sorter.sorted:
-            self._persist()  # writes ONLY roots + any finalized child groups
+            # We don't need a massive _persist() run.
             self._persisted_after_auto_root = True
 
         # 3) Prep parents & auto-handle trivial children
@@ -317,8 +317,7 @@ class RankingController:
         self._decide(False)
 
     def flush(self):
-        # Persist roots and any finalized children. Do NOT delete anything new here.
-        self._persist()
+        # We process edits independently now.
         self._final_cleanup_for_parents()
 
     # ---- internal decision logic ----
@@ -327,8 +326,7 @@ class RankingController:
         if self.roots_sorter.has_work():
             placed_root = self.roots_sorter.decide(left)
             if placed_root:
-                # For roots we persist as we go (like before).
-                self._persist()
+                self._persist_task(placed_root)
                 pid = placed_root.get("id")
                 if pid:
                     if DELETE_PARENTS_IMMEDIATELY:
@@ -343,71 +341,139 @@ class RankingController:
         placed_child = self.child_sorter.decide(left)
         if placed_child:
             pid = self.current_parent_id
-            # Queue the subtask for deletion LATER (after a successful persist).
             self._pending_child_deletes_by_parent.setdefault(pid, []).append(placed_child)
 
-            # When the child sorter finishes:
             if not self.child_sorter.has_work():
-                # 1) finalize order for this parent
                 self.children_sorted_by_parent_id[pid] = list(self.child_sorter.sorted)
+                self._persist_task(placed_child)
 
-                # 2) persist FIRST; if it fails, do NOT delete
-                persist_ok = False
-                try:
-                    self._persist()
-                    persist_ok = True
-                except Exception as e:
-                    print(f"[WARN] Persist failed; not deleting children for parent id={pid}: {e}")
+                for ch in self._pending_child_deletes_by_parent.get(pid, []):
+                    self._delete_task(ch)
+                self._pending_child_deletes_by_parent[pid] = []
+                self._delete_parent_if_ready(pid)
 
-                # 3) only after a successful persist, delete queued subtasks (and then parent)
-                if persist_ok:
-                    for ch in self._pending_child_deletes_by_parent.get(pid, []):
-                        self._delete_task(ch)
-                    self._pending_child_deletes_by_parent[pid] = []
-                    self._delete_parent_if_ready(pid)
-
-                # reset active child sorter
                 self.current_parent_id = None
                 self.child_sorter = None
+            else:
+                self._persist_task(placed_child)
 
     # ---- persistence & activation ----
 
-    def _persist(self):
-        """
-        Write current state to the sheet:
-          - Roots (always in current order).
-          - Subtasks:
-              * For parents whose ranking is FINISHED: use finalized order.
-              * For all other parents: preserve the children that already exist in the sheet.
-        """
+    def update_task_if_exists(self, task: Dict[str, Any]):
+        if not task:
+            return
+        _, _, flat_tasks = self.sheets.read_full_state(self.spreadsheet_id, self.sheet_tab)
+        
+        def task_key(t):
+            p = t.get("_parent_title") or ""
+            title = t.get("title") or ""
+            return (self._norm(p), self._norm(title))
 
-        def _parent_key_for_children(parent_task: Dict[str, Any]) -> Any:
-            # Prefer stable ID; fall back to title for sheet-only parents with no GT id.
-            return parent_task.get("id") or (parent_task.get("title") or "")
+        k = task_key(task)
+        for ft in flat_tasks:
+            if task_key(ft) == k:
+                row_idx = ft["_row_index"]
+                vals = self._row_vals(task, ft)
+                self.sheets.update_row(self.spreadsheet_id, self.sheet_tab, row_idx, vals)
+                return
 
-        # 1) Seed with baseline children from the sheet for *every* root
-        children_union: Dict[Any, List[Dict[str, Any]]] = {}
+    def _row_vals(self, task: Dict[str, Any], ft: Optional[Dict[str, Any]]) -> List[str]:
+        raw_title = (task.get("title") or "").strip()
+        parent_title = (task.get("_parent_title") or "").strip()
+        title = ("  " + raw_title) if parent_title else raw_title
+        desc = (task.get("notes") or "").strip()
+        link = (task.get("_link") or "").strip()
+        if desc and link and desc == link:
+            desc = ""
+
+        category = (task.get("category") or "").strip()
+        effort = (task.get("effort") or "").strip()
+        joy = (task.get("joy") or "").strip()
+
+        status = ""
+        if ft:
+            status = ft.get("status") or ""
+            if not category: category = ft.get("category") or ""
+            if not effort: effort = ft.get("effort") or ""
+            if not joy: joy = ft.get("joy") or ""
+
+        return [status, category, title, parent_title, desc, effort, joy, link]
+
+    def _persist_task(self, placed_item: Dict[str, Any]):
+        """
+        Figures out physical row for placed_item and inserts or updates.
+        """
+        if not placed_item:
+            return
+            
+        _, _, flat_tasks = self.sheets.read_full_state(self.spreadsheet_id, self.sheet_tab)
+        
+        def task_key(t):
+            p = t.get("_parent_title") or ""
+            title = t.get("title") or ""
+            return (self._norm(p), self._norm(title))
+
+        placed_key = task_key(placed_item)
+        
+        # Check if already in sheet
+        for ft in flat_tasks:
+            if task_key(ft) == placed_key:
+                self.sheets.update_row(self.spreadsheet_id, self.sheet_tab, ft["_row_index"], self._row_vals(placed_item, ft))
+                return
+                
+        # Needs insert
+        logical = []
         for r in self.roots_sorter.sorted:
-            key = _parent_key_for_children(r)
-            if not key:
-                continue
-            base_title = (r.get("title") or "")
-            base_children = self.baseline_children_by_title.get(base_title, [])
-            if base_children:
-                # copy to avoid aliasing
-                children_union[key] = list(base_children)
+            logical.append(r)
+            pid = r.get("id")
+            base_title = r.get("title") or ""
+            
+            if self.current_parent_id == pid and self.child_sorter:
+                logical.extend(self.child_sorter.sorted)
+            else:
+                final_children = self.children_sorted_by_parent_id.get(pid) or self.children_sorted_by_parent_id.get(base_title)
+                if final_children is not None:
+                    logical.extend(final_children)
+                else:
+                    existing_children = self.baseline_children_by_title.get(base_title, [])
+                    logical.extend(existing_children)
 
-        # 2) Override with any parents that are fully finalized
-        for pid, lst in self.children_sorted_by_parent_id.items():
-            children_union[pid] = list(lst)
+        try:
+            idx = logical.index(placed_item)
+        except ValueError:
+            self.sheets.insert_row(self.spreadsheet_id, self.sheet_tab, len(flat_tasks) + 1, self._row_vals(placed_item, None))
+            return
+            
+        if idx == 0:
+            target_row_idx = 1
+        else:
+            prev_item = logical[idx - 1]
+            prev_key = task_key(prev_item)
+            
+            flat_idx = -1
+            for i, ft in enumerate(flat_tasks):
+                if task_key(ft) == prev_key:
+                    flat_idx = i
+                    break
+                    
+            if flat_idx == -1:
+                target_row_idx = len(flat_tasks) + 1
+            else:
+                insert_after_flat_idx = flat_idx
+                prev_title_norm = self._norm(prev_item.get("title"))
+                
+                placed_is_sub = bool(placed_item.get("_parent_title"))
+                if not placed_is_sub:
+                    while insert_after_flat_idx + 1 < len(flat_tasks):
+                        next_ft = flat_tasks[insert_after_flat_idx + 1]
+                        if self._norm(next_ft.get("_parent_title") or "") == prev_title_norm:
+                            insert_after_flat_idx += 1
+                        else:
+                            break
+                            
+                target_row_idx = flat_tasks[insert_after_flat_idx]["_row_index"] + 1
 
-        # 3) Authoritatively write:
-        self.sheets.write_full_state(
-            self.spreadsheet_id,
-            self.sheet_tab,
-            self.roots_sorter.sorted,
-            children_union
-        )
+        self.sheets.insert_row(self.spreadsheet_id, self.sheet_tab, target_row_idx, self._row_vals(placed_item, None))
 
     def _auto_place_trivial_children(self):
         # If a parent has exactly 1 child, finalize immediately (no comparisons needed).
@@ -419,16 +485,10 @@ class RankingController:
             if len(rem) == 1:
                 child = rem.pop(0)
                 self.children_sorted_by_parent_id.setdefault(pid, []).append(child)
-                # Persist first; if OK, delete child and possibly parent
-                persist_ok = False
-                try:
-                    self._persist()
-                    persist_ok = True
-                except Exception as e:
-                    print(f"[WARN] Persist failed in trivial child path; not deleting child for parent id={pid}: {e}")
-                if persist_ok:
-                    self._delete_task(child)
-                    self._delete_parent_if_ready(pid)
+                # No massive array persist, we persist the single child in the loop
+                self._persist_task(child)
+                self._delete_task(child)
+                self._delete_parent_if_ready(pid)
 
     def _activate_next_parent_group(self) -> bool:
         while self.parent_order_ids:
@@ -444,7 +504,12 @@ class RankingController:
                 self.parent_order_ids.pop(0)
                 continue
             self.current_parent_id = pid
-            self.child_sorter = PairwiseBinarySorter(already_sorted=[], remaining=rem)
+            
+            parent_task = next((r for r in self.roots_sorter.sorted if r.get("id") == pid), None)
+            base_title = (parent_task.get("title") or "") if parent_task else ""
+            base_children = list(self.baseline_children_by_title.get(base_title, []))
+            
+            self.child_sorter = PairwiseBinarySorter(already_sorted=base_children, remaining=rem)
             self.children_remaining_by_parent_id[pid] = []
             return True
         return False
@@ -508,22 +573,29 @@ class RankingController:
 # --------- UI ---------
 
 class TaskPane:
-    def __init__(self, parent_frame: tk.Frame, on_pick, category_values: List[str]):
+    def __init__(self, parent_frame: tk.Frame, on_pick, category_values: List[str], headers: List[str] = None):
         self.frame = tk.Frame(parent_frame, bd=1, relief="groove")
         self.frame.pack_propagate(False)
 
         self.title_btn = tk.Button(self.frame, text="", font=("Arial", 16, "bold"), wraplength=420, command=on_pick)
         self.title_btn.pack(fill="x", padx=10, pady=(10, 6))
 
+        c_cat = headers[1] if headers and len(headers) > 1 else "Category"
+        c_desc = headers[4] if headers and len(headers) > 4 else "Description"
+        c_eff = headers[5] if headers and len(headers) > 5 else "Effort"
+        c_joy = headers[6] if headers and len(headers) > 6 else "Joy"
+        c_link = headers[7] if headers and len(headers) > 7 else "Link"
+        c_parent = headers[3] if headers and len(headers) > 3 else "Parent Title"
+
         # Category row (editable dropdown)
         cat_row = tk.Frame(self.frame)
         cat_row.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Label(cat_row, text="Category:", anchor="w").pack(side="left")
+        tk.Label(cat_row, text=f"{c_cat}:", anchor="w").pack(side="left")
         self.category_combo = ttk.Combobox(cat_row, values=category_values)
         self.category_combo.pack(side="left", fill="x", expand=True)
         self.category_combo.configure(state="normal")  # allow typing
 
-        tk.Label(self.frame, text="Description:", anchor="w").pack(fill="x", padx=10)
+        tk.Label(self.frame, text=f"{c_desc}:", anchor="w").pack(fill="x", padx=10)
         self.desc = tk.Text(self.frame, height=12, wrap="word")
         self.desc.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
@@ -535,18 +607,18 @@ class TaskPane:
         ej_row.grid_columnconfigure(1, weight=1, uniform="ej")
         ej_row.grid_columnconfigure(3, weight=1, uniform="ej")
 
-        tk.Label(ej_row, text="Effort (hours)", anchor="w").grid(row=0, column=0, sticky="w", padx=(0,6))
+        tk.Label(ej_row, text=c_eff, anchor="w").grid(row=0, column=0, sticky="w", padx=(0,6))
         self.effort_val = tk.Entry(ej_row)
         self.effort_val.grid(row=0, column=1, sticky="ew", padx=(0,12))
 
-        tk.Label(ej_row, text="Joy (1-5)", anchor="w").grid(row=0, column=2, sticky="w", padx=(0,6))
+        tk.Label(ej_row, text=c_joy, anchor="w").grid(row=0, column=2, sticky="w", padx=(0,6))
         self.joy_val = tk.Entry(ej_row)
         self.joy_val.grid(row=0, column=3, sticky="ew")
 
         # Parent (readonly)
         self.parent_row = tk.Frame(self.frame)
         self.parent_row.pack(fill="x", padx=10, pady=(0, 4))
-        tk.Label(self.parent_row, text="Parent:", anchor="w").pack(side="left")
+        tk.Label(self.parent_row, text=f"{c_parent}:", anchor="w").pack(side="left")
         self.parent_val = tk.Entry(self.parent_row)
         self.parent_val.pack(side="left", fill="x", expand=True)
         self.parent_val.configure(state="readonly")
@@ -554,7 +626,7 @@ class TaskPane:
         # Link (editable)
         link_row = tk.Frame(self.frame)
         link_row.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Label(link_row, text="Link:", anchor="w").pack(side="left")
+        tk.Label(link_row, text=f"{c_link}:", anchor="w").pack(side="left")
         self.link_val = tk.Entry(link_row)
         self.link_val.pack(side="left", fill="x", expand=True)
 
@@ -637,7 +709,7 @@ class UIStatePersist:
             pass
 
 class RankerUI:
-    def __init__(self, controller, state_path: str, category_values: List[str], list_name: Optional[str] = None):
+    def __init__(self, controller, state_path: str, category_values: List[str], headers: List[str], list_name: Optional[str] = None):
         self.controller = controller
         self.state = UIStatePersist(state_path)
         self.list_name = list_name or "All tasks"
@@ -673,9 +745,9 @@ class RankerUI:
         mid = tk.Frame(self.root)
         mid.pack(fill="both", expand=True, padx=12, pady=6)
 
-        self.left = TaskPane(mid, on_pick=self._pick_left, category_values=category_values)
+        self.left = TaskPane(mid, on_pick=self._pick_left, category_values=category_values, headers=headers)
         self.left.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.right = TaskPane(mid, on_pick=self._pick_right, category_values=category_values)
+        self.right = TaskPane(mid, on_pick=self._pick_right, category_values=category_values, headers=headers)
         self.right.frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         mid.grid_columnconfigure(0, weight=1, uniform="col")
@@ -736,6 +808,8 @@ class RankerUI:
             self.left.apply_edits_to_task()
             self.right.apply_edits_to_task()
             a, b = self._current_pair
+            self.controller.update_task_if_exists(a)
+            self.controller.update_task_if_exists(b)
             self.controller.choose_left(a, b)
         self._refresh()
 
@@ -744,6 +818,8 @@ class RankerUI:
             self.left.apply_edits_to_task()
             self.right.apply_edits_to_task()
             a, b = self._current_pair
+            self.controller.update_task_if_exists(a)
+            self.controller.update_task_if_exists(b)
             self.controller.choose_right(a, b)
         self._refresh()
 
@@ -775,18 +851,6 @@ def main():
     sheet_tab = sheets.ensure_tab(spreadsheet_id, sheet_tab)
     sheets.ensure_tab(spreadsheet_id, categories_tab)
 
-    # Prime header if missing/wrong
-    try:
-        sheets._require_header_or_fail(spreadsheet_id, sheet_tab)  # private but safe here
-    except Exception:
-        sheets.clear_values(spreadsheet_id, sheet_tab)
-        sheets.service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{sheet_tab}!A1",
-            valueInputOption="RAW",
-            body={"values": [list(HEADER)]},
-        ).execute()
-
     # Install validations (idempotent)
     sheets.ensure_status_dropdown_and_colors(spreadsheet_id, sheet_tab)
     sheets.ensure_category_dropdown(spreadsheet_id, sheet_tab, categories_tab)
@@ -795,7 +859,8 @@ def main():
     category_values = sheets.read_categories(spreadsheet_id, categories_tab)
 
     # Read sheet baseline
-    roots_from_sheet, children_from_sheet_by_title = sheets.read_full_state(spreadsheet_id, sheet_tab)
+    headers = sheets.get_headers(spreadsheet_id, sheet_tab)
+    roots_from_sheet, children_from_sheet_by_title, _ = sheets.read_full_state(spreadsheet_id, sheet_tab)
 
     # Fetch Google Tasks
     gt = GoogleTasks()
@@ -807,7 +872,7 @@ def main():
     print(
         f"\n============================================================================\n"
         f"Loaded {sheet_task_count} tasks from the spreadsheet tab '{sheet_tab}'.  \n"
-        f"Will merge {gt_task_count} tasks from gTasks list '{task_list_name or 'All tasks'}'.\n"
+        f"Will rank against {gt_task_count} tasks from gTasks list '{task_list_name or 'All tasks'}'.\n"
         f"============================================================================\n\n"
     )
 
@@ -822,7 +887,7 @@ def main():
         children_from_gt_by_id=children_from_gt_by_id,
     )
 
-    ui = RankerUI(controller, state_path=ui_state_path, category_values=category_values, list_name=task_list_name or "All tasks")
+    ui = RankerUI(controller, state_path=ui_state_path, category_values=category_values, headers=headers, list_name=task_list_name or "All tasks")
     ui.run()
 
 if __name__ == "__main__":
