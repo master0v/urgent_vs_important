@@ -418,6 +418,7 @@ class RankingController:
         # Check if already in sheet
         for ft in flat_tasks:
             if task_key(ft) == placed_key:
+                placed_item["_inserted_row"] = ft["_row_index"]
                 self.sheets.update_row(self.spreadsheet_id, self.sheet_tab, ft["_row_index"], self._row_vals(placed_item, ft))
                 return
                 
@@ -441,7 +442,9 @@ class RankingController:
         try:
             idx = logical.index(placed_item)
         except ValueError:
-            self.sheets.insert_row(self.spreadsheet_id, self.sheet_tab, len(flat_tasks) + 1, self._row_vals(placed_item, None))
+            target_row_idx = len(flat_tasks) + 1
+            placed_item["_inserted_row"] = target_row_idx
+            self.sheets.insert_row(self.spreadsheet_id, self.sheet_tab, target_row_idx, self._row_vals(placed_item, None))
             return
             
         if idx == 0:
@@ -473,6 +476,7 @@ class RankingController:
                             
                 target_row_idx = flat_tasks[insert_after_flat_idx]["_row_index"] + 1
 
+        placed_item["_inserted_row"] = target_row_idx
         self.sheets.insert_row(self.spreadsheet_id, self.sheet_tab, target_row_idx, self._row_vals(placed_item, None))
 
     def _auto_place_trivial_children(self):
@@ -538,7 +542,7 @@ class RankingController:
 
     def _delete_task(self, task: Dict[str, Any]):
         """
-        Delete a task. Print details for BOTH tasks and subtasks.
+        Delete a task. Print single-line summary mapping to sheet row.
         """
         tid = task.get("id")
         if not tid or tid in self.deleted_ids:
@@ -549,20 +553,11 @@ class RankingController:
 
         is_sub = bool(task.get("parent"))
         kind = "subtask" if is_sub else "task"
-
-        print(f"\n[Deleting {kind}]")
-        print(f"  Title:        {task.get('title') or ''}")
-        if is_sub:
-            print(f"  Parent Title: {task.get('_parent_title') or ''}")
-        print(f"  Notes:        {task.get('notes') or ''}")
-        print(f"  Category:     {task.get('category') or ''}")
-        print(f"  Effort:       {task.get('effort') or ''}")
-        print(f"  Joy:          {task.get('joy') or ''}")
-        print(f"  Link:         {task.get('_link') or ''}")
-        print(f"  TaskList ID:  {task.get('task_list_id') or ''}")
-        print(f"  Task ID:      {task.get('id') or ''}")
-        print(f"  List Title:   {task.get('list_title') or ''}")
-        print(f"[/Deleting {kind}]\n")
+        title = task.get("title") or ""
+        row = task.get("_inserted_row") or task.get("_row_index")
+        row_str = f" at row {row + 1}" if row is not None else ""
+        
+        print(f"Placed {kind} '{title}'{row_str}.")
 
         try:
             self.gt.service.tasks().delete(tasklist=tlist, task=tid).execute()
