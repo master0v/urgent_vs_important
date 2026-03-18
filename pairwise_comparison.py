@@ -775,9 +775,6 @@ class RankerUI:
         self.remaining = tk.Label(self.root, text=f"Remaining 0 tasks in '{self.list_name}'", font=("Arial", 12))
         self.remaining.pack(fill="x", padx=12, pady=(6, 12))
 
-        self.root.bind("<Left>",  lambda e: self._pick_left())
-        self.root.bind("<Right>", lambda e: self._pick_right())
-
         self._current_pair: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
         self._refresh()
 
